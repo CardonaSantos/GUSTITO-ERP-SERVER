@@ -34,6 +34,7 @@ import { validateOrReject } from 'class-validator';
 import { QueryParamsInventariado } from './query/query';
 import { newQueryDTO } from './query/newQuery';
 import type { Multer } from 'multer';
+import { DeleteProductDto } from './dto/delete-dto';
 
 // ---- DTOS del payload que esperas en tu servicio ----
 interface PrecioProductoDto {
@@ -309,8 +310,6 @@ export class ProductsController {
     return this.productsService.create(dto, productImages, presImages);
   }
 
-  // ====== GETs ESPECÍFICOS (static primero) =================================
-
   /** POS (búsqueda y filtros) */
   @Get('get-products-presentations-for-pos')
   async findAllProductToSale(
@@ -322,7 +321,7 @@ export class ProductsController {
     )
     dto: newQueryDTO,
   ) {
-    return await this.productsService.getProductPresentationsForPOS(dto);
+    return await this.productsService.getProductsForPOS(dto);
   }
 
   /** Inventario general */
@@ -541,9 +540,13 @@ export class ProductsController {
     return await this.productsService.removeAll();
   }
 
-  /** DELETE catch-all por id */
+  /** DELETE */
   @Delete(':id')
-  async remove(@Param('id', ParseIntPipe) id: number) {
-    return await this.productsService.remove(id);
+  async remove(
+    @Param('id', ParseIntPipe) id: number,
+
+    @Body() dto: DeleteProductDto,
+  ) {
+    return await this.productsService.remove(id, dto);
   }
 }

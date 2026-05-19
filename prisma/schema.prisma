@@ -306,6 +306,11 @@ model Producto {
   asientosContablesLineas AsientoContableLinea[]
   kardexValorizado        KardexValorizado[]
 
+  // ELIMINACION
+  activo      Boolean   @default(true)
+  eliminado   Boolean   @default(false)
+  eliminadoEn DateTime?
+  eliminadoPorId Int?
 
 }
 

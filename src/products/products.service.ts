@@ -7,15 +7,19 @@ import {
   Logger,
   MethodNotAllowedException,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
-import { CreateProductDto } from './dto/create-product.dto';
-import { UpdateProductDto } from './dto/update-product.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CreateNewProductDto } from './dto/create-productNew.dto';
 import { MinimunStockAlertService } from 'src/minimun-stock-alert/minimun-stock-alert.service';
 import { CloudinaryService } from 'src/cloudinary/cloudinary.service';
-import { EstadoPrecio, Prisma, RolPrecio, TipoPrecio } from '@prisma/client';
-
+import {
+  EstadoPrecio,
+  Prisma,
+  Rol,
+  RolPrecio,
+  TipoPrecio,
+} from '@prisma/client';
 import { PresentacionProductoService } from 'src/presentacion-producto/presentacion-producto.service';
 import { ProductoApi } from './dto/interfacesPromise';
 import { QueryParamsInventariado } from './query/query';
@@ -32,35 +36,26 @@ import {
   StocksBySucursal,
   StocksProducto,
 } from './ResponseInterface';
-
 import { dayjs } from 'src/utils/dayjs';
-
 import { newQueryDTO } from './query/newQuery';
 import { verifyProps } from 'src/utils/verifyPropsFromDTO';
 import { buildSearchForPresentacion, buildSearchForProducto } from './HELPERS';
 import { itemsBase } from './seed/utils';
+import { DeleteProductDto } from './dto/delete-dto';
+import brcrypt from 'bcryptjs';
 
-const toDecimal = (value: string | number) => {
-  return new Prisma.Decimal(value);
-};
 const INS = 'insensitive' as const;
 
-//HELPÉ
 @Injectable()
 export class ProductsService {
   private readonly logger = new Logger(ProductsService.name);
   constructor(
     private readonly prisma: PrismaService,
-
-    private readonly minimunStockAlert: MinimunStockAlertService,
     private readonly cloudinaryService: CloudinaryService,
     private readonly presentacionPrducto: PresentacionProductoService,
   ) {}
   private dec = (v: any): string => (v == null ? '0' : String(v));
 
-  //AJUSTAR CREACION DE IMAGENES
-  // products.service.ts (solo el método create)
-  // products.service.ts
   async create(
     dto: CreateNewProductDto,
     imagenes: Express.Multer.File[],
@@ -78,16 +73,10 @@ export class ProductsService {
         precioCostoActual,
         presentaciones,
         stockMinimo,
-        // ✅ NUEVO
         tipoPresentacionId,
       } = dto;
 
-      this.logger.log(
-        `DTO recibido en crear producto:\n${JSON.stringify(dto, null, 2)}`,
-      );
-
       return await this.prisma.$transaction(async (tx) => {
-        // ✅ (opcional pero recomendado) Pre-chequeo de duplicado de código
         const dup = await tx.producto.findUnique({ where: { codigoProducto } });
         if (dup) {
           throw new BadRequestException(
@@ -100,7 +89,6 @@ export class ProductsService {
             ? Number(precioCostoActual)
             : null;
 
-        // ✅ Vincular TipoPresentacion al PRODUCTO
         const newProduct = await tx.producto.create({
           data: {
             precioCostoActual: costoActualNumber,
@@ -113,11 +101,10 @@ export class ProductsService {
             },
             ...(tipoPresentacionId
               ? { tipoPresentacion: { connect: { id: tipoPresentacionId } } }
-              : {}), // o { tipoPresentacionId } directamente
+              : {}),
           },
         });
 
-        // Precios a nivel producto
         await Promise.all(
           (precioVenta ?? []).map((precio) =>
             tx.precioProducto.create({
@@ -170,7 +157,6 @@ export class ProductsService {
           this.logger.debug('No hay imágenes de producto para subir/crear');
         }
 
-        // ✅ Presentaciones (con tipoPresentacionId y categoriaIds)
         const createdPresentations = await this.presentacionPrducto.create(
           tx,
           presentaciones ?? [],
@@ -314,72 +300,39 @@ export class ProductsService {
   }
 
   /**
-   * Funcion que retorna y filtra productos para el POS, apoyandose de servicios que usa el inventariado
+   * Función que retorna y filtra productos para el POS.
+   * Usa los mismos filtros base del inventario, pero únicamente trabaja con productos.
+   *
    * @param dto
-   * @returns PRODUCTOS Y PRESENTACIONES FILTRADAS PARA UN TABLE PAGINADO
+   * @returns PRODUCTOS FILTRADOS PARA UNA TABLA PAGINADA
    */
-  async getProductPresentationsForPOS(dto: newQueryDTO) {
+  async getProductsForPOS(dto: newQueryDTO) {
     try {
-      this.logger.log(
-        `DTO recibido en search de productos POS:\n${JSON.stringify(dto, null, 2)}`,
-      );
-
       verifyProps<newQueryDTO>(dto, ['sucursalId', 'limit', 'page']);
+
       const page = Math.max(1, Number(dto.page) || 1);
       const limit = Math.min(Math.max(1, Number(dto.limit) || 20), 100);
+      const skip = (page - 1) * limit;
 
-      const whereProducto: Prisma.ProductoWhereInput = {};
-      const wherePresentacion: Prisma.ProductoPresentacionWhereInput = {};
+      const whereProducto: Prisma.ProductoWhereInput = {
+        activo: true,
+      };
 
       this.asignePropsWhereInput(dto, whereProducto);
-      this.asignePropsWhereInputPresentation(dto, wherePresentacion);
-      this.logger.debug(
-        'WHERE Producto => ' + JSON.stringify(whereProducto, null, 2),
-      );
-      this.logger.debug(
-        'WHERE Presentación => ' + JSON.stringify(wherePresentacion, null, 2),
-      );
 
-      // Para paginar el "mix" :
-      const [totalProducts, totalPresentations] = await Promise.all([
-        this.prisma.producto.count({ where: whereProducto }),
-        this.prisma.productoPresentacion.count({ where: wherePresentacion }),
-      ]);
+      const [totalProducts, products] = await Promise.all([
+        this.prisma.producto.count({
+          where: whereProducto,
+        }),
 
-      const totalCount = totalProducts + totalPresentations;
-      const totalPages = Math.max(1, Math.ceil(totalCount / limit));
-      const skipCombined = (page - 1) * limit;
-
-      let skipProd = 0;
-      let skipPres = 0;
-      if (skipCombined < totalProducts) {
-        skipProd = skipCombined;
-      } else {
-        skipProd = totalProducts;
-        skipPres = skipCombined - totalProducts;
-      }
-
-      const takeProd = Math.max(0, Math.min(limit, totalProducts - skipProd));
-      const remaining = limit - takeProd;
-      const takePres = Math.max(
-        0,
-        Math.min(remaining, totalPresentations - skipPres),
-      );
-
-      const [products, presentations] = await Promise.all([
         this.prisma.producto.findMany({
           where: whereProducto,
-          skip: skipProd,
-          take: takeProd,
+          skip,
+          take: limit,
           select: productoSelect,
-          orderBy: { id: 'asc' },
-        }),
-        this.prisma.productoPresentacion.findMany({
-          where: wherePresentacion,
-          skip: skipPres,
-          take: takePres,
-          select: presentacionSelect,
-          orderBy: { id: 'asc' },
+          orderBy: {
+            id: 'asc',
+          },
         }),
       ]);
 
@@ -387,36 +340,32 @@ export class ProductsService {
         ? this.normalizerProductsInventario(products, dto.sucursalId)
         : [];
 
-      const presentationsArray = Array.isArray(presentations)
-        ? this.normalizerProductPresentacionInventario(
-            presentations,
-            dto.sucursalId,
-          )
-        : [];
-
-      const mixed = [
-        ...productsArray.map((x) => ({ ...x, __source: 'producto' })),
-        ...presentationsArray.map((x) => ({ ...x, __source: 'presentacion' })),
-      ];
+      const totalPages = Math.max(1, Math.ceil(totalProducts / limit));
 
       return {
-        data: mixed,
+        data: productsArray.map((producto) => ({
+          ...producto,
+          __source: 'producto',
+        })),
         meta: {
-          totalCount,
+          totalCount: totalProducts,
           totalPages,
           page,
           limit,
           totals: {
             productos: totalProducts,
-            presentaciones: totalPresentations,
           },
         },
       };
     } catch (error) {
       this.logger.error('Error generado en get productos POS: ', error);
-      if (error instanceof HttpException) throw error;
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
       throw new InternalServerErrorException(
-        'Fatal Error: Error inesperado en modulo de productos',
+        'Fatal Error: Error inesperado en módulo de productos',
       );
     }
   }
@@ -767,16 +716,92 @@ export class ProductsService {
     }
   }
 
-  async remove(id: number) {
-    try {
-      const producto = await this.prisma.producto.delete({
-        where: { id },
-      });
-      return producto;
-    } catch (error) {
-      console.log(error);
-      throw new InternalServerErrorException('Error al eliminar el producto');
+  async remove(id: number, dto: DeleteProductDto) {
+    const { password, userId } = dto;
+
+    const user = await this.prisma.usuario.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        contrasena: true,
+        rol: true,
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('Usuario no encontrado');
     }
+
+    const isAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(user.rol);
+
+    if (!isAdmin) {
+      throw new UnauthorizedException(
+        'Solo un administrador puede eliminar productos',
+      );
+    }
+
+    const passwordMatches = await brcrypt.compare(password, user.contrasena);
+
+    if (!passwordMatches) {
+      throw new UnauthorizedException('Contraseña incorrecta');
+    }
+
+    const producto = await this.prisma.producto.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        nombre: true,
+        codigoProducto: true,
+        eliminado: true,
+      },
+    });
+
+    if (!producto) {
+      throw new NotFoundException('Producto no encontrado');
+    }
+
+    if (producto.eliminado) {
+      throw new BadRequestException('Este producto ya fue eliminado');
+    }
+
+    const [ventas, stock, precios, historialStock, compras] = await Promise.all(
+      [
+        this.prisma.ventaProducto.count({ where: { productoId: id } }),
+        this.prisma.stock.count({ where: { productoId: id } }),
+        this.prisma.precioProducto.count({ where: { productoId: id } }),
+        this.prisma.historialStock.count({ where: { productoId: id } }),
+        this.prisma.compraDetalle.count({ where: { productoId: id } }),
+      ],
+    );
+
+    const dependencias = {
+      ventas,
+      stock,
+      precios,
+      historialStock,
+      compras,
+    };
+
+    const tieneMovimientos = Object.values(dependencias).some(
+      (total) => total > 0,
+    );
+
+    if (tieneMovimientos) {
+      return this.prisma.producto.update({
+        where: { id },
+        data: {
+          activo: false,
+          eliminado: true,
+          eliminadoEn: new Date(),
+          eliminadoPorId: user.id,
+          codigoProducto: `${producto.codigoProducto}__ELIMINADO__${producto.id}`,
+        },
+      });
+    }
+
+    return this.prisma.producto.delete({
+      where: { id },
+    });
   }
 
   async removeAll() {
@@ -1007,17 +1032,17 @@ export class ProductsService {
       } = dto;
       this.logger.log('nuevo para inventariado');
       const skip = (page - 1) * limit;
-      this.logger.log(
-        `DTO recibido para filtrado en inventariado es:\n${JSON.stringify(dto, null, 2)}`,
-      );
+
       const where: Prisma.ProductoWhereInput = {};
       const wherePresentaciones: Prisma.ProductoPresentacionWhereInput = {};
 
-      // --- q unificada (fallback a campos legacy) ---
       const qRaw = (q ?? productoNombre ?? codigoProducto ?? '').trim();
       const hasUnifiedQ = !!qRaw;
 
-      // ---- Filtros ORTOGONALES (se conservan) ----
+      where.activo = {
+        equals: true,
+      };
+
       if (categorias && categorias.length > 0) {
         where.categorias = { some: { id: { in: categorias } } };
         wherePresentaciones.producto = {
@@ -1098,8 +1123,6 @@ export class ProductsService {
         'INV WHERE Presentación => ' +
           JSON.stringify(wherePresentaciones, null, 2),
       );
-
-      this.logger.log(`DTO recibido:\n${JSON.stringify(dto, null, 2)}`);
 
       const [productos, presentaciones, totalProductos, totalPresentaciones]: [
         ProductoWithSelect[],

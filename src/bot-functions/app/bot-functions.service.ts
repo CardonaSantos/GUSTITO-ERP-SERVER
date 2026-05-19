@@ -1,19 +1,12 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
-import { CreateBotFunctionDto } from '../dto/create-bot-function.dto';
-import { UpdateBotFunctionDto } from '../dto/update-bot-function.dto';
+import { Injectable, Logger } from '@nestjs/common';
 import { BotSearchProductoDto } from '../dto/searchDto.dto';
-import { BOT_FUNCTIONS, BotFunctions } from '../domain/bot-functions.domain';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class BotFunctionsService {
   private readonly logger = new Logger(BotFunctionsService.name);
-  constructor(
-    private readonly prisma: PrismaService,
-
-    // @Inject(BOT_FUNCTIONS)
-    // private readonly bot_functions_repo: BotFunctions,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
   async search(dto: BotSearchProductoDto) {
     try {
       if (!dto) {
@@ -27,7 +20,8 @@ export class BotFunctionsService {
 
       const { producto, categorias } = dto;
 
-      const where: any = {
+      const where: Prisma.ProductoWhereInput = {
+        activo: true,
         nombre: {
           contains: producto,
           mode: 'insensitive',
