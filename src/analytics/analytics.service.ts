@@ -9,44 +9,66 @@ import { CreateAnalyticsDto } from './dto/create-analytics.dto';
 import { UpdateAnalyticsDto } from './dto/update-analytics.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { dayjs } from 'src/utils/dayjs';
+import { Prisma } from '@prisma/client';
+
+const ventaMesSelect = Prisma.validator<Prisma.VentaSelect>()({
+  id: true,
+  fechaVenta: true,
+  totalVenta: true,
+});
+type VentaMesRow = Prisma.VentaGetPayload<{
+  select: typeof ventaMesSelect;
+}>;
+
+type VentaMesAgrupada = {
+  key: string;
+  label: string;
+  total: number;
+  cantidadVentas: number;
+  ventas: VentaMesRow[];
+};
+
+type ComparativoMesChartItem = {
+  mesNumero: number;
+  anio: number;
+  mes: string;
+  label: string;
+  totalVentas: number;
+  porcentaje: number;
+  esMesActual: boolean;
+};
+
+type VentasDiaSemanaChartItem = {
+  diaNumero: number;
+  dia: string;
+  totalVentas: number;
+  cantidadVentas: number;
+  porcentaje: number;
+};
+
+type TendenciaVentasDiariasItem = {
+  fecha: string;
+  label: string;
+  dia: string;
+  mes: string;
+  anio: number;
+  totalVentas: number;
+  cantidadVentas: number;
+};
+
+type TendenciaVentasDiariasResponse = {
+  rangoMeses: number;
+  fechaInicio: string;
+  fechaFin: string;
+  totalPeriodo: number;
+  cantidadVentasPeriodo: number;
+  data: TendenciaVentasDiariasItem[];
+};
 
 @Injectable()
 export class AnalyticsService {
   private readonly logger = new Logger(AnalyticsService.name);
   constructor(private readonly prisma: PrismaService) {}
-
-  async getDashboardSummary(idSucursal: number) {
-    try {
-      // Hacemos todas las llamadas en paralelo para mejorar rendimiento
-      const [
-        ventasMes,
-        ventasSemana,
-        ventasDia,
-        ventasSemanalChart,
-        masVendidos,
-        ventasRecientes,
-      ] = await Promise.all([
-        this.getVentasMes(idSucursal),
-        this.getTotalVentasMontoSemana(idSucursal),
-        this.getVentasDiaII(idSucursal),
-        this.getVentasSemanalChart(idSucursal),
-        this.getProductosMasVendidos(),
-        this.getVentasRecientes(),
-      ]);
-
-      return {
-        ventasMes,
-        ventasSemana,
-        ventasDia,
-        ventasSemanalChart,
-        masVendidos,
-        ventasRecientes,
-      };
-    } catch (error) {
-      console.error('Error en getDashboardSummary:', error);
-      throw new InternalServerErrorException('No se pudo cargar el dashboard');
-    }
-  }
 
   async getVendedorDashboardData(userId: number) {
     try {
@@ -212,156 +234,535 @@ export class AnalyticsService {
     }
   }
 
-  //--------------------------------------------------
+  // UTILITARIOS
 
-  async getVentasMes(idSucursal: number) {
+  /**
+   * Conseguir ventas del mes actual y meses anteriores según rango.
+   *
+   */
+  async getVentasMes(idSucursal: number, rango: number = 2) {
     try {
-      // 1. Grab “now” in Guatemala time
-      const guatNow = dayjs().tz('America/Guatemala');
-      // 2. Compute start/end of the LOCAL month
-      const startOfMonth = guatNow.startOf('month').utc().toDate();
-      const endOfMonth = guatNow.endOf('month').utc().toDate();
+      const safeRango = Math.min(Math.max(Number(rango) || 2, 1), 24);
 
-      // 3. Query between those UTC instants
-      const ventasMes = await this.prisma.venta.findMany({
+      if (!idSucursal) {
+        throw new BadRequestException('Sucursal requerida');
+      }
+
+      const today = dayjs();
+
+      const startDate = today
+        .subtract(safeRango - 1, 'month')
+        .startOf('month')
+        .toDate();
+
+      const endDate = today.endOf('month').toDate();
+
+      const ventas = await this.prisma.venta.findMany({
         where: {
           sucursalId: idSucursal,
           fechaVenta: {
-            gte: startOfMonth,
-            lte: endOfMonth,
+            gte: startDate,
+            lte: endDate,
           },
         },
-        orderBy: { fechaVenta: 'desc' },
-        select: { totalVenta: true },
+        orderBy: {
+          fechaVenta: 'desc',
+        },
+        select: ventaMesSelect,
       });
 
-      // 4. Sum up
-      const totalVentasMes = ventasMes.reduce(
-        (sum, v) => sum + v.totalVenta,
+      const mesesBase = Array.from({ length: safeRango }, (_, index) => {
+        const date = today.subtract(safeRango - 1 - index, 'month');
+
+        const key = date.format('YYYY-MM');
+
+        return {
+          key,
+          label: date.format('MMMM YYYY'),
+          total: 0,
+          cantidadVentas: 0,
+          ventas: [],
+        } satisfies VentaMesAgrupada;
+      });
+
+      const agrupadoInicial = mesesBase.reduce<
+        Record<string, VentaMesAgrupada>
+      >((acc, mes) => {
+        acc[mes.key] = mes;
+        return acc;
+      }, {});
+
+      const agrupado = ventas.reduce<Record<string, VentaMesAgrupada>>(
+        (acc, venta) => {
+          const keyMonth = dayjs(venta.fechaVenta).format('YYYY-MM');
+
+          if (!acc[keyMonth]) {
+            acc[keyMonth] = {
+              key: keyMonth,
+              label: dayjs(venta.fechaVenta).format('MMMM YYYY'),
+              total: 0,
+              cantidadVentas: 0,
+              ventas: [],
+            };
+          }
+
+          acc[keyMonth].total += Number(venta.totalVenta ?? 0);
+          acc[keyMonth].cantidadVentas += 1;
+          // acc[keyMonth].ventas.push(venta);
+
+          return acc;
+        },
+        agrupadoInicial,
+      );
+
+      const data = Object.values(agrupado);
+
+      return {
+        data,
+        meta: {
+          sucursalId: idSucursal,
+          rango: safeRango,
+          desde: startDate,
+          hasta: endDate,
+          totalGeneral: data.reduce((acc, mes) => acc + mes.total, 0),
+          cantidadVentasGeneral: data.reduce(
+            (acc, mes) => acc + mes.cantidadVentas,
+            0,
+          ),
+        },
+      };
+    } catch (error) {
+      this.logger.error('Error generado en getVentasMes:', error);
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      throw new InternalServerErrorException(
+        'Error inesperado al obtener ventas por mes',
+      );
+    }
+  }
+
+  async getMejorMes() {
+    try {
+      const today = dayjs();
+
+      const startYear = today.startOf('year').toDate();
+      const endYear = today.endOf('year').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          mes: number;
+          totalVentas: number;
+          cantidadVentas: number;
+        }[]
+      >`
+      SELECT 
+        EXTRACT(MONTH FROM "fechaVenta")::int AS mes,
+        SUM("totalVenta")::float AS "totalVentas",
+        COUNT(*)::int AS "cantidadVentas"
+      FROM "Venta"
+      WHERE "fechaVenta" >= ${startYear}
+        AND "fechaVenta" <= ${endYear}
+      GROUP BY mes
+      ORDER BY "totalVentas" DESC
+      LIMIT 1;
+    `;
+
+      const mejorMes = result[0];
+
+      const mesString = mejorMes
+        ? dayjs()
+            .month(mejorMes.mes - 1)
+            .format('MMMM')
+        : null;
+
+      return {
+        mes: mesString,
+        totalVentas: mejorMes?.totalVentas ?? 0,
+        cantidadVentas: mejorMes?.cantidadVentas ?? 0,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getMejorDia() {
+    try {
+      const today = dayjs();
+
+      const startMonth = today.startOf('month').toDate();
+      const endMonth = today.endOf('month').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          dia: number;
+          totalVentas: number;
+          cantidadVentas: number;
+        }[]
+      >`
+      SELECT 
+        EXTRACT(DAY FROM "fechaVenta")::int AS dia,
+        SUM("totalVenta")::float AS "totalVentas",
+        COUNT(*)::int AS "cantidadVentas"
+      FROM "Venta"
+      WHERE "fechaVenta" >= ${startMonth}
+        AND "fechaVenta" <= ${endMonth}
+      GROUP BY dia
+      ORDER BY "totalVentas" DESC
+      LIMIT 1;
+    `;
+
+      const mejorDia = result[0];
+
+      const diaString = mejorDia
+        ? dayjs().date(mejorDia.dia).format('DD [de] MMMM')
+        : null;
+
+      return {
+        dia: diaString,
+        diaNumero: mejorDia?.dia ?? null,
+        totalVentas: mejorDia?.totalVentas ?? 0,
+        cantidadVentas: mejorDia?.cantidadVentas ?? 0,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getCategoriaTop() {
+    try {
+      const result = await this.prisma.$queryRaw<
+        {
+          categoriaId: number;
+          categoriaNombre: string;
+          totalVentas: number;
+          cantidadVendida: number;
+          productosVendidos: number;
+        }[]
+      >`
+      SELECT
+        c."id" AS "categoriaId",
+        c."nombre" AS "categoriaNombre",
+        SUM(vp."cantidad" * vp."precioVenta")::float AS "totalVentas",
+        SUM(vp."cantidad")::int AS "cantidadVendida",
+        COUNT(vp."id")::int AS "productosVendidos"
+      FROM "VentaProducto" vp
+      INNER JOIN "Venta" v ON v."id" = vp."ventaId"
+      INNER JOIN "Producto" p ON p."id" = vp."productoId"
+      INNER JOIN "_CategoriaToProducto" cp ON cp."B" = p."id"
+      INNER JOIN "Categoria" c ON c."id" = cp."A"
+      WHERE v."anulada" = false
+        AND vp."estado" = 'VENDIDO'
+        AND vp."productoId" IS NOT NULL
+      GROUP BY c."id", c."nombre"
+      ORDER BY "totalVentas" DESC
+      LIMIT 1;
+    `;
+
+      const categoriaTop = result[0];
+
+      return {
+        categoriaId: categoriaTop?.categoriaId ?? null,
+        categoriaNombre: categoriaTop?.categoriaNombre ?? null,
+        totalVentas: categoriaTop?.totalVentas ?? 0,
+        cantidadVendida: categoriaTop?.cantidadVendida ?? 0,
+        productosVendidos: categoriaTop?.productosVendidos ?? 0,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getTransaccionesMes() {
+    try {
+      const today = dayjs();
+
+      const startMonth = today.startOf('month').toDate();
+      const endMonth = today.endOf('month').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          transacciones: number;
+          diasActivos: number;
+        }[]
+      >`
+      SELECT
+        COUNT(v."id")::int AS "transacciones",
+        COUNT(DISTINCT DATE(v."fechaVenta"))::int AS "diasActivos"
+      FROM "Venta" v
+      WHERE v."fechaVenta" >= ${startMonth}
+        AND v."fechaVenta" <= ${endMonth}
+        AND v."anulada" = false;
+    `;
+
+      const data = result[0];
+
+      return {
+        transacciones: data?.transacciones ?? 0,
+        diasActivos: data?.diasActivos ?? 0,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getComparativoVentasPorMes(rango: number = 2) {
+    try {
+      const today = dayjs();
+
+      const startDate = today
+        .subtract(rango - 1, 'month')
+        .startOf('month')
+        .toDate();
+
+      const endDate = today.endOf('month').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          mes: number;
+          anio: number;
+          totalVentas: number;
+        }[]
+      >`
+      SELECT
+        EXTRACT(MONTH FROM v."fechaVenta")::int AS mes,
+        EXTRACT(YEAR FROM v."fechaVenta")::int AS anio,
+        COALESCE(SUM(v."totalVenta"), 0)::float AS "totalVentas"
+      FROM "Venta" v
+      WHERE v."fechaVenta" >= ${startDate}
+        AND v."fechaVenta" <= ${endDate}
+        AND v."anulada" = false
+      GROUP BY anio, mes
+      ORDER BY anio ASC, mes ASC;
+    `;
+
+      const ventasMap = new Map<string, number>();
+
+      for (const item of result) {
+        ventasMap.set(`${item.anio}-${item.mes}`, item.totalVentas);
+      }
+
+      const meses: ComparativoMesChartItem[] = Array.from(
+        { length: rango },
+        (_, index) => {
+          const date = today.subtract(rango - 1 - index, 'month');
+          const mesNumero = date.month() + 1;
+          const anio = date.year();
+
+          const totalVentas = ventasMap.get(`${anio}-${mesNumero}`) ?? 0;
+
+          return {
+            mesNumero,
+            anio,
+            mes: date.locale('es').format('MMMM'),
+            label: date.locale('es').format('MMMM YYYY'),
+            totalVentas,
+            porcentaje: 0,
+            esMesActual:
+              mesNumero === today.month() + 1 && anio === today.year(),
+          };
+        },
+      );
+
+      const totalPeriodo = meses.reduce(
+        (acc, item) => acc + item.totalVentas,
         0,
       );
 
-      return totalVentasMes;
+      const data = meses.map((item) => ({
+        ...item,
+        porcentaje:
+          totalPeriodo > 0
+            ? Number(((item.totalVentas / totalPeriodo) * 100).toFixed(1))
+            : 0,
+      }));
+
+      return {
+        totalPeriodo,
+        data,
+      };
     } catch (error) {
-      console.error('Error al encontrar los registros de venta:', error);
-      throw new InternalServerErrorException(
-        'Error al encontrar los registros de venta',
-      );
+      this.logger.error(error);
+      throw error;
     }
   }
 
-  async getVentasDia(idSucursal: number, fecha?: string): Promise<number> {
-    // Si no se pasa una fecha, usamos la fecha actual
-    const fechaActual = fecha ? new Date(fecha) : new Date();
-
-    // Eliminar la hora de la fecha seleccionada
-    const inicioDia = new Date(
-      fechaActual.getFullYear(),
-      fechaActual.getMonth(),
-      fechaActual.getDate(),
-      0,
-      0,
-      0,
-    );
-    const finDia = new Date(
-      fechaActual.getFullYear(),
-      fechaActual.getMonth(),
-      fechaActual.getDate(),
-      23,
-      59,
-      59,
-    );
-
+  async getVentasPorDiaSemanaMesActual() {
     try {
-      const ventasTotalMonto = await this.prisma.venta.aggregate({
-        where: {
-          sucursalId: idSucursal,
-          fechaVenta: {
-            gte: inicioDia, // Inicio del día
-            lte: finDia, // Fin del día
-          },
-        },
-        _sum: {
-          totalVenta: true, // Sumar el total de ventas
-        },
+      const today = dayjs();
+
+      const startMonth = today.startOf('month').toDate();
+      const endMonth = today.endOf('month').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          diaNumero: number;
+          totalVentas: number;
+          cantidadVentas: number;
+        }[]
+      >`
+      SELECT
+        EXTRACT(DOW FROM v."fechaVenta")::int AS "diaNumero",
+        COALESCE(SUM(v."totalVenta"), 0)::float AS "totalVentas",
+        COUNT(v."id")::int AS "cantidadVentas"
+      FROM "Venta" v
+      WHERE v."fechaVenta" >= ${startMonth}
+        AND v."fechaVenta" <= ${endMonth}
+        AND v."anulada" = false
+      GROUP BY "diaNumero"
+      ORDER BY "diaNumero" ASC;
+    `;
+
+      const diasSemana = [
+        { diaNumero: 0, dia: 'Domingo' },
+        { diaNumero: 1, dia: 'Lunes' },
+        { diaNumero: 2, dia: 'Martes' },
+        { diaNumero: 3, dia: 'Miércoles' },
+        { diaNumero: 4, dia: 'Jueves' },
+        { diaNumero: 5, dia: 'Viernes' },
+        { diaNumero: 6, dia: 'Sábado' },
+      ];
+
+      const ventasMap = new Map<
+        number,
+        {
+          totalVentas: number;
+          cantidadVentas: number;
+        }
+      >();
+
+      for (const item of result) {
+        ventasMap.set(item.diaNumero, {
+          totalVentas: item.totalVentas,
+          cantidadVentas: item.cantidadVentas,
+        });
+      }
+
+      const maxVenta = Math.max(...result.map((item) => item.totalVentas), 0);
+
+      const data: VentasDiaSemanaChartItem[] = diasSemana.map((dia) => {
+        const venta = ventasMap.get(dia.diaNumero);
+
+        const totalVentas = venta?.totalVentas ?? 0;
+        const cantidadVentas = venta?.cantidadVentas ?? 0;
+
+        return {
+          diaNumero: dia.diaNumero,
+          dia: dia.dia,
+          totalVentas,
+          cantidadVentas,
+          porcentaje:
+            maxVenta > 0
+              ? Number(((totalVentas / maxVenta) * 100).toFixed(1))
+              : 0,
+        };
       });
 
-      return ventasTotalMonto._sum.totalVenta || 0; // Si no hay ventas, retorna 0
+      return {
+        data,
+      };
     } catch (error) {
-      console.error('Error al calcular las ventas del día:', error);
-      throw new InternalServerErrorException(
-        'Error al calcular el monto total de ventas del día',
-      );
+      this.logger.error(error);
+      throw error;
     }
   }
 
-  async getVentasDiaII(idSucursal: number) {
+  async getTendenciaVentasDiarias(
+    rangoMeses: number = 2,
+  ): Promise<TendenciaVentasDiariasResponse> {
     try {
-      // Obtenemos la fecha de "hoy"
-      const now = new Date();
+      const safeRango = Math.max(1, Math.min(rangoMeses, 12));
 
-      // Año, mes, día (en JavaScript, los meses arrancan en 0)
-      const year = now.getFullYear();
-      const month = now.getMonth();
-      const day = now.getDate();
+      const today = dayjs();
 
-      // Construimos el rango de la medianoche hasta las 23:59:59
-      const startOfDay = new Date(year, month, day, 0, 0, 0);
-      const endOfDay = new Date(year, month, day, 23, 59, 59);
+      const startDate = today.subtract(safeRango - 1, 'month').startOf('month');
 
-      // Buscamos todas las ventas hechas entre ese rango de fechas (independiente de la hora exacta)
-      const ventasDeHoy = await this.prisma.venta.findMany({
-        where: {
-          sucursalId: idSucursal,
-          fechaVenta: {
-            gte: startOfDay, // >= 2 de ene, 2025 00:00:00
-            lte: endOfDay, // <= 2 de ene, 2025 23:59:59
-          },
-        },
-      });
+      const endDate = today.endOf('day');
 
-      // Sumamos el total de ventas de este día
-      const totalDeHoy = ventasDeHoy.reduce(
-        (acc, venta) => acc + venta.totalVenta,
+      const result = await this.prisma.$queryRaw<
+        {
+          fecha: Date;
+          totalVentas: number;
+          cantidadVentas: number;
+        }[]
+      >`
+      SELECT
+        DATE(v."fechaVenta") AS fecha,
+        COALESCE(SUM(v."totalVenta"), 0)::float AS "totalVentas",
+        COUNT(v."id")::int AS "cantidadVentas"
+      FROM "Venta" v
+      WHERE v."fechaVenta" >= ${startDate.toDate()}
+        AND v."fechaVenta" <= ${endDate.toDate()}
+        AND v."anulada" = false
+      GROUP BY DATE(v."fechaVenta")
+      ORDER BY fecha ASC;
+    `;
+
+      const ventasMap = new Map<
+        string,
+        {
+          totalVentas: number;
+          cantidadVentas: number;
+        }
+      >();
+
+      for (const item of result) {
+        const fechaKey = dayjs(item.fecha).format('YYYY-MM-DD');
+
+        ventasMap.set(fechaKey, {
+          totalVentas: item.totalVentas,
+          cantidadVentas: item.cantidadVentas,
+        });
+      }
+
+      const data: TendenciaVentasDiariasItem[] = [];
+
+      let cursor = startDate;
+
+      while (cursor.isBefore(endDate, 'day') || cursor.isSame(endDate, 'day')) {
+        const fechaKey = cursor.format('YYYY-MM-DD');
+        const venta = ventasMap.get(fechaKey);
+
+        data.push({
+          fecha: fechaKey,
+          label: cursor.format('DD/MM'),
+          dia: cursor.format('DD'),
+          mes: cursor.locale('es').format('MMM').toUpperCase(),
+          anio: cursor.year(),
+          totalVentas: venta?.totalVentas ?? 0,
+          cantidadVentas: venta?.cantidadVentas ?? 0,
+        });
+
+        cursor = cursor.add(1, 'day');
+      }
+
+      const totalPeriodo = data.reduce(
+        (acc, item) => acc + item.totalVentas,
         0,
       );
 
-      return totalDeHoy;
-    } catch (error) {
-      console.error('Error al obtener el total de ventas de hoy:', error);
-      throw new InternalServerErrorException(
-        'No se pudo obtener el total de ventas de hoy',
+      const cantidadVentasPeriodo = data.reduce(
+        (acc, item) => acc + item.cantidadVentas,
+        0,
       );
+
+      return {
+        rangoMeses: safeRango,
+        fechaInicio: startDate.format('YYYY-MM-DD'),
+        fechaFin: endDate.format('YYYY-MM-DD'),
+        totalPeriodo,
+        cantidadVentasPeriodo,
+        data,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
     }
-  }
-
-  create(createAnalyticsDto: CreateAnalyticsDto) {
-    return 'This action adds a new analytics';
-  }
-
-  findAll() {
-    return `This action returns all analytics`;
-  }
-
-  findOne(id: number) {
-    return `This action returns a #${id} analytics`;
-  }
-
-  update(id: number, updateAnalyticsDto: UpdateAnalyticsDto) {
-    return `This action updates a #${id} analytics`;
-  }
-
-  remove(id: number) {
-    return `This action removes a #${id} analytics`;
-  }
-
-  async getSucursalesSummary() {
-    const sucursales = await this.prisma.sucursal.findMany({
-      include: {
-        saldosDiarios: true,
-      },
-    });
-
-    return sucursales;
   }
 }
