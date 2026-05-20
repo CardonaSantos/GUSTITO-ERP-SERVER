@@ -9,6 +9,7 @@ async function bootstrap() {
     origin: [
       // 'https://sandy.up.railway.app',
       'https://nova-pos-erp.up.railway.app',
+      'https://gustito-erp.up.railway.app',
       'http://localhost:5174',
       'http://localhost:5173',
     ],
