@@ -23,8 +23,6 @@ export class MetasService {
 
   async createSellerGoal(createMetaDTO: CreateMetaUsuarioDto) {
     try {
-      console.log('Datos recibidos:', createMetaDTO);
-
       const sucursal = await this.prisma.sucursal.findUnique({
         where: { id: createMetaDTO.sucursalId },
       });
@@ -769,9 +767,9 @@ export class MetasService {
     tx: Prisma.TransactionClient,
   ) {
     try {
-      if (!userID || monto <= 0) {
-        throw new BadRequestException('Datos inválidos al incrementar meta');
-      }
+      // if (!userID || monto <= 0) {
+      //   throw new BadRequestException('Datos inválidos al incrementar meta');
+      // }
 
       if (tipo === 'tienda') {
         const meta = await tx.metaUsuario.findFirst({

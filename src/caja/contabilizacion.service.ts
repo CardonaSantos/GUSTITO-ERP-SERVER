@@ -37,9 +37,9 @@ export class ContabilizacionVentasService {
     asientoContableId: number | null;
   }> {
     const total = Number(input.totalVenta);
-    if (!Number.isFinite(total) || total <= 0) {
-      throw new BadRequestException('El total de la venta debe ser mayor a 0');
-    }
+    // if (!Number.isFinite(total) || total <= 0) {
+    //   throw new BadRequestException('El total de la venta debe ser mayor a 0');
+    // }
 
     const esEfectivo =
       input.metodoPago === MetodoPago.EFECTIVO ||

@@ -65,176 +65,316 @@ type TendenciaVentasDiariasResponse = {
   data: TendenciaVentasDiariasItem[];
 };
 
+type AnalyticsBlock<T> = {
+  ok: boolean;
+  data: T;
+  error: string | null;
+};
+
+type MejorMesAnalytics = {
+  mes: string | null;
+  totalVentas: number;
+  cantidadVentas: number;
+};
+
+type MejorDiaAnalytics = {
+  dia: string | null;
+  diaNumero: number | null;
+  totalVentas: number;
+  cantidadVentas: number;
+};
+
+type CategoriaTopAnalytics = {
+  categoriaId: number | null;
+  categoriaNombre: string | null;
+  totalVentas: number;
+  cantidadVendida: number;
+  productosVendidos: number;
+};
+
+type TransaccionesMesAnalytics = {
+  transacciones: number;
+  diasActivos: number;
+};
+
+type ComparativoVentasPorMesResponse = {
+  totalPeriodo: number;
+  data: ComparativoMesChartItem[];
+};
+
+type VentasDiaSemanaResponse = {
+  data: VentasDiaSemanaChartItem[];
+};
+
+type TopProductoIngresoItem = {
+  ranking: number;
+  productoId: number | null;
+  productoNombre: string;
+  totalVentas: number;
+  cantidadVendida: number;
+  porcentajeBarra: number;
+};
+
+type TopCategoriaIngresoItem = {
+  ranking: number;
+  categoriaId: number;
+  categoriaNombre: string;
+  totalVentas: number;
+  cantidadVendida: number;
+  porcentajeBarra: number;
+};
+
+type TopProductosPorIngresoResponse = {
+  rangoMeses: number;
+  fechaInicio: string;
+  fechaFin: string;
+  data: TopProductoIngresoItem[];
+};
+
+type TopCategoriasPorIngresoResponse = {
+  rangoMeses: number;
+  fechaInicio: string;
+  fechaFin: string;
+  data: TopCategoriaIngresoItem[];
+};
+
+type DashboardVentasAnalyticsResponse = {
+  meta: {
+    rangoMeses: number;
+    idSucursal: number | null;
+    generadoEn: string;
+  };
+
+  resumen: {
+    mejorMes: AnalyticsBlock<MejorMesAnalytics>;
+    mejorDia: AnalyticsBlock<MejorDiaAnalytics>;
+    categoriaTop: AnalyticsBlock<CategoriaTopAnalytics>;
+    transaccionesMes: AnalyticsBlock<TransaccionesMesAnalytics>;
+  };
+
+  charts: {
+    comparativoVentasPorMes: AnalyticsBlock<ComparativoVentasPorMesResponse>;
+    ventasPorDiaSemana: AnalyticsBlock<VentasDiaSemanaResponse>;
+    tendenciaVentasDiarias: AnalyticsBlock<TendenciaVentasDiariasResponse>;
+    topProductosPorIngreso: AnalyticsBlock<TopProductosPorIngresoResponse>;
+    topCategoriasPorIngreso: AnalyticsBlock<TopCategoriasPorIngresoResponse>;
+    topFechasPorIngreso: AnalyticsBlock<TopFechasPorIngresoResponse>;
+  };
+};
+
+type TopFechaIngresoItem = {
+  ranking: number;
+  fecha: string;
+  label: string;
+  dia: string;
+  mes: string;
+  anio: number;
+  totalVentas: number;
+  cantidadVentas: number;
+  porcentajeBarra: number;
+};
+
+type TopFechasPorIngresoResponse = {
+  rangoMeses: number;
+  fechaInicio: string;
+  fechaFin: string;
+  data: TopFechaIngresoItem[];
+};
+
 @Injectable()
 export class AnalyticsService {
   private readonly logger = new Logger(AnalyticsService.name);
   constructor(private readonly prisma: PrismaService) {}
 
-  async getVendedorDashboardData(userId: number) {
+  // MAIN CALL
+
+  private async safeAnalyticsCall<T>(
+    label: string,
+    callback: () => Promise<T>,
+    fallback: T,
+  ): Promise<AnalyticsBlock<T>> {
     try {
+      const data = await callback();
+
+      return {
+        ok: true,
+        data,
+        error: null,
+      };
     } catch (error) {
-      this.logger.error('error generado es: ', error);
-      if (error instanceof HttpException) throw error;
-      throw new InternalServerErrorException('Fatal error: Error inesperado');
+      this.logger.error(`[AnalyticsDashboard] Error en ${label}`, error);
+
+      return {
+        ok: false,
+        data: fallback,
+        error: `No se pudo cargar ${label}`,
+      };
     }
   }
 
-  async getTotalVentasMontoSemana(sucursalId: number) {
-    try {
-      const guatNow = dayjs().tz('America/Guatemala');
+  async getDashboardVentasAnalytics(
+    rangoMeses: number = 2,
+    idSucursal?: number,
+  ): Promise<DashboardVentasAnalyticsResponse> {
+    const safeRango = Math.max(1, Math.min(Number(rangoMeses) || 2, 12));
+    const safeSucursalId = idSucursal ? Number(idSucursal) : null;
 
-      const daysSinceMonday = (guatNow.day() + 6) % 7;
-      const startLocal = guatNow
-        .subtract(daysSinceMonday, 'day')
-        .startOf('day');
-      const endLocal = startLocal.add(6, 'day').endOf('day');
-
-      const startUTC = startLocal.utc().toDate();
-      const endUTC = endLocal.utc().toDate();
-
-      const ventas = await this.prisma.venta.findMany({
-        where: {
-          sucursalId,
-          fechaVenta: {
-            gte: startUTC,
-            lte: endUTC,
-          },
+    const [
+      mejorMes,
+      mejorDia,
+      categoriaTop,
+      transaccionesMes,
+      comparativoVentasPorMes,
+      ventasPorDiaSemana,
+      tendenciaVentasDiarias,
+      topProductosPorIngreso,
+      topCategoriasPorIngreso,
+      topFechasPorIngreso,
+    ] = await Promise.all([
+      this.safeAnalyticsCall<MejorMesAnalytics>(
+        'mejor mes',
+        () => this.getMejorMes(),
+        {
+          mes: null,
+          totalVentas: 0,
+          cantidadVentas: 0,
         },
-        select: { totalVenta: true },
-      });
+      ),
 
-      return ventas.reduce((sum, { totalVenta }) => sum + totalVenta, 0);
-    } catch (error) {
-      console.error('Error al calcular monto semanal:', error);
-      throw new InternalServerErrorException(
-        'Error al calcular el monto total de ventas de la semana',
-      );
-    }
+      this.safeAnalyticsCall<MejorDiaAnalytics>(
+        'mejor día',
+        () => this.getMejorDia(),
+        {
+          dia: null,
+          diaNumero: null,
+          totalVentas: 0,
+          cantidadVentas: 0,
+        },
+      ),
+
+      this.safeAnalyticsCall<CategoriaTopAnalytics>(
+        'categoría top',
+        () => this.getCategoriaTop(),
+        {
+          categoriaId: null,
+          categoriaNombre: null,
+          totalVentas: 0,
+          cantidadVendida: 0,
+          productosVendidos: 0,
+        },
+      ),
+
+      this.safeAnalyticsCall<TransaccionesMesAnalytics>(
+        'transacciones del mes',
+        () => this.getTransaccionesMes(),
+        {
+          transacciones: 0,
+          diasActivos: 0,
+        },
+      ),
+
+      this.safeAnalyticsCall<ComparativoVentasPorMesResponse>(
+        'comparativo ventas por mes',
+        () => this.getComparativoVentasPorMes(safeRango),
+        {
+          totalPeriodo: 0,
+          data: [],
+        },
+      ),
+
+      this.safeAnalyticsCall<VentasDiaSemanaResponse>(
+        'ventas por día de la semana',
+        () => this.getVentasPorDiaSemanaMesActual(),
+        {
+          data: [],
+        },
+      ),
+
+      this.safeAnalyticsCall<TendenciaVentasDiariasResponse>(
+        'tendencia ventas diarias',
+        () => this.getTendenciaVentasDiarias(safeRango),
+        {
+          rangoMeses: safeRango,
+          fechaInicio: '',
+          fechaFin: '',
+          totalPeriodo: 0,
+          cantidadVentasPeriodo: 0,
+          data: [],
+        },
+      ),
+
+      this.safeAnalyticsCall<TopProductosPorIngresoResponse>(
+        'top productos por ingreso',
+        () =>
+          this.getTopProductosPorIngreso(
+            safeRango,
+            10,
+            safeSucursalId ?? undefined,
+          ),
+        {
+          rangoMeses: safeRango,
+          fechaInicio: '',
+          fechaFin: '',
+          data: [],
+        },
+      ),
+
+      this.safeAnalyticsCall<TopCategoriasPorIngresoResponse>(
+        'top categorías por ingreso',
+        () =>
+          this.getTopCategoriasPorIngreso(
+            safeRango,
+            12,
+            safeSucursalId ?? undefined,
+          ),
+        {
+          rangoMeses: safeRango,
+          fechaInicio: '',
+          fechaFin: '',
+          data: [],
+        },
+      ),
+
+      this.safeAnalyticsCall<TopFechasPorIngresoResponse>(
+        'top fechas por ingreso',
+        () =>
+          this.getTopFechasPorIngreso(
+            safeRango,
+            5,
+            safeSucursalId ?? undefined,
+          ),
+        {
+          rangoMeses: safeRango,
+          fechaInicio: '',
+          fechaFin: '',
+          data: [],
+        },
+      ),
+    ]);
+    return {
+      meta: {
+        rangoMeses: safeRango,
+        idSucursal: safeSucursalId,
+        generadoEn: dayjs().toISOString(),
+      },
+
+      resumen: {
+        mejorMes,
+        mejorDia,
+        categoriaTop,
+        transaccionesMes,
+      },
+
+      charts: {
+        comparativoVentasPorMes,
+        ventasPorDiaSemana,
+        tendenciaVentasDiarias,
+        topProductosPorIngreso,
+        topCategoriasPorIngreso,
+        topFechasPorIngreso,
+      },
+    };
   }
-
-  async getVentasSemanalChart(sucursalId: number) {
-    try {
-      const guatNow = dayjs().tz('America/Guatemala');
-      const primerDiaSemana = guatNow.startOf('week');
-      const ultimoDiaSemana = guatNow.endOf('week');
-
-      const ventasPorDia = await this.prisma.venta.groupBy({
-        by: ['fechaVenta'],
-        where: {
-          sucursalId: sucursalId,
-          fechaVenta: {
-            gte: primerDiaSemana.toDate(),
-            lte: ultimoDiaSemana.toDate(),
-          },
-        },
-        _sum: {
-          totalVenta: true,
-        },
-        _count: {
-          id: true,
-        },
-      });
-
-      const diasSemana = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];
-      const ventasSemanal = diasSemana.map((dia, index) => {
-        const fecha = primerDiaSemana.add(index, 'day');
-        return {
-          dia,
-          totalVenta: 0,
-          ventas: 0,
-          fecha: fecha.toISOString(),
-        };
-      });
-
-      ventasPorDia.forEach((venta) => {
-        const fechaVenta = dayjs(venta.fechaVenta)
-          .tz('America/Guatemala')
-          .startOf('day');
-        const diaIndex = fechaVenta.day() === 0 ? 6 : fechaVenta.day() - 1; // Lunes = 0, Domingo = 6
-
-        if (ventasSemanal[diaIndex]) {
-          ventasSemanal[diaIndex].totalVenta += venta._sum.totalVenta || 0;
-          ventasSemanal[diaIndex].ventas += venta._count.id || 0;
-        }
-      });
-
-      return ventasSemanal;
-    } catch (error) {
-      console.log(error);
-      throw new InternalServerErrorException(
-        'Error al calcular el monto total de ventas de la semana',
-      );
-    }
-  }
-
-  async getProductosMasVendidos() {
-    try {
-      // Consulta para obtener los 10 productos más vendidos en una sucursal específica
-      const productosMasVendidos = await this.prisma.producto.findMany({
-        include: {
-          ventas: {
-            select: {
-              cantidad: true,
-            },
-          },
-        },
-      });
-
-      // Calcular la suma total de ventas por producto
-      const productosConTotalVentas = productosMasVendidos.map((producto) => {
-        const totalVentas = producto.ventas.reduce(
-          (total, venta) => total + venta.cantidad,
-          0,
-        );
-        return {
-          id: producto.id,
-          nombre: producto.nombre,
-          totalVentas,
-        };
-      });
-
-      // Ordenar los productos por el total de ventas y tomar los 10 primeros
-      const topProductos = productosConTotalVentas
-        .sort((a, b) => b.totalVentas - a.totalVentas)
-        .slice(0, 10);
-
-      return topProductos;
-    } catch (error) {
-      console.log(error);
-      throw new InternalServerErrorException(
-        'Error al calcular los productos más vendidos',
-      );
-    }
-  }
-
-  async getVentasRecientes() {
-    try {
-      const ventasRecientes = await this.prisma.venta.findMany({
-        take: 10,
-        orderBy: {
-          fechaVenta: 'desc',
-        },
-        select: {
-          id: true,
-          fechaVenta: true,
-          totalVenta: true,
-          sucursal: {
-            select: {
-              id: true,
-              nombre: true,
-            },
-          },
-        },
-      });
-
-      return ventasRecientes;
-    } catch (error) {
-      console.log(error);
-      throw new BadRequestException('Error al conseguir ventas recientes');
-    }
-  }
-
-  // UTILITARIOS
 
   /**
    * Conseguir ventas del mes actual y meses anteriores según rango.
@@ -758,6 +898,221 @@ export class AnalyticsService {
         fechaFin: endDate.format('YYYY-MM-DD'),
         totalPeriodo,
         cantidadVentasPeriodo,
+        data,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getTopProductosPorIngreso(
+    rangoMeses: number = 2,
+    limit: number = 10,
+    idSucursal?: number,
+  ) {
+    try {
+      const safeRango = Math.max(1, Math.min(rangoMeses, 12));
+      const safeLimit = Math.max(1, Math.min(limit, 50));
+
+      const today = dayjs();
+
+      const startDate = today
+        .subtract(safeRango - 1, 'month')
+        .startOf('month')
+        .toDate();
+
+      const endDate = today.endOf('day').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          productoId: number | null;
+          productoNombre: string;
+          totalVentas: number;
+          cantidadVendida: number;
+        }[]
+      >`
+      SELECT
+        p."id" AS "productoId",
+        COALESCE(p."nombre", 'Producto eliminado') AS "productoNombre",
+        COALESCE(SUM(vp."cantidad" * vp."precioVenta"), 0)::float AS "totalVentas",
+        COALESCE(SUM(vp."cantidad"), 0)::int AS "cantidadVendida"
+      FROM "VentaProducto" vp
+      INNER JOIN "Venta" v ON v."id" = vp."ventaId"
+      LEFT JOIN "Producto" p ON p."id" = vp."productoId"
+      WHERE v."fechaVenta" >= ${startDate}
+        AND v."fechaVenta" <= ${endDate}
+        AND v."anulada" = false
+        AND vp."estado" = 'VENDIDO'
+        ${idSucursal ? Prisma.sql`AND v."sucursalId" = ${idSucursal}` : Prisma.empty}
+      GROUP BY p."id", p."nombre"
+      ORDER BY "totalVentas" DESC
+      LIMIT ${safeLimit};
+    `;
+
+      const maxVenta = Math.max(...result.map((item) => item.totalVentas), 0);
+
+      const data = result.map((item, index) => ({
+        ranking: index + 1,
+        productoId: item.productoId,
+        productoNombre: item.productoNombre,
+        totalVentas: item.totalVentas,
+        cantidadVendida: item.cantidadVendida,
+        porcentajeBarra:
+          maxVenta > 0
+            ? Number(((item.totalVentas / maxVenta) * 100).toFixed(1))
+            : 0,
+      }));
+
+      return {
+        rangoMeses: safeRango,
+        fechaInicio: dayjs(startDate).format('YYYY-MM-DD'),
+        fechaFin: dayjs(endDate).format('YYYY-MM-DD'),
+        data,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getTopCategoriasPorIngreso(
+    rangoMeses: number = 2,
+    limit: number = 12,
+    idSucursal?: number,
+  ) {
+    try {
+      const safeRango = Math.max(1, Math.min(rangoMeses, 12));
+      const safeLimit = Math.max(1, Math.min(limit, 50));
+
+      const today = dayjs();
+
+      const startDate = today
+        .subtract(safeRango - 1, 'month')
+        .startOf('month')
+        .toDate();
+
+      const endDate = today.endOf('day').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          categoriaId: number;
+          categoriaNombre: string;
+          totalVentas: number;
+          cantidadVendida: number;
+        }[]
+      >`
+      SELECT
+        c."id" AS "categoriaId",
+        c."nombre" AS "categoriaNombre",
+        COALESCE(SUM(vp."cantidad" * vp."precioVenta"), 0)::float AS "totalVentas",
+        COALESCE(SUM(vp."cantidad"), 0)::int AS "cantidadVendida"
+      FROM "VentaProducto" vp
+      INNER JOIN "Venta" v ON v."id" = vp."ventaId"
+      INNER JOIN "Producto" p ON p."id" = vp."productoId"
+      INNER JOIN "_CategoriaToProducto" cp ON cp."B" = p."id"
+      INNER JOIN "Categoria" c ON c."id" = cp."A"
+      WHERE v."fechaVenta" >= ${startDate}
+        AND v."fechaVenta" <= ${endDate}
+        AND v."anulada" = false
+        AND vp."estado" = 'VENDIDO'
+        AND vp."productoId" IS NOT NULL
+        ${idSucursal ? Prisma.sql`AND v."sucursalId" = ${idSucursal}` : Prisma.empty}
+      GROUP BY c."id", c."nombre"
+      ORDER BY "totalVentas" DESC
+      LIMIT ${safeLimit};
+    `;
+
+      const maxVenta = Math.max(...result.map((item) => item.totalVentas), 0);
+
+      const data = result.map((item, index) => ({
+        ranking: index + 1,
+        categoriaId: item.categoriaId,
+        categoriaNombre: item.categoriaNombre,
+        totalVentas: item.totalVentas,
+        cantidadVendida: item.cantidadVendida,
+        porcentajeBarra:
+          maxVenta > 0
+            ? Number(((item.totalVentas / maxVenta) * 100).toFixed(1))
+            : 0,
+      }));
+
+      return {
+        rangoMeses: safeRango,
+        fechaInicio: dayjs(startDate).format('YYYY-MM-DD'),
+        fechaFin: dayjs(endDate).format('YYYY-MM-DD'),
+        data,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw error;
+    }
+  }
+
+  async getTopFechasPorIngreso(
+    rangoMeses: number = 2,
+    limit: number = 5,
+    idSucursal?: number,
+  ): Promise<TopFechasPorIngresoResponse> {
+    try {
+      const safeRango = Math.max(1, Math.min(Number(rangoMeses) || 2, 12));
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 5, 30));
+
+      const today = dayjs();
+
+      const startDate = today
+        .subtract(safeRango - 1, 'month')
+        .startOf('month')
+        .toDate();
+
+      const endDate = today.endOf('day').toDate();
+
+      const result = await this.prisma.$queryRaw<
+        {
+          fecha: Date;
+          totalVentas: number;
+          cantidadVentas: number;
+        }[]
+      >`
+      SELECT
+        DATE(v."fechaVenta") AS fecha,
+        COALESCE(SUM(v."totalVenta"), 0)::float AS "totalVentas",
+        COUNT(v."id")::int AS "cantidadVentas"
+      FROM "Venta" v
+      WHERE v."fechaVenta" >= ${startDate}
+        AND v."fechaVenta" <= ${endDate}
+        AND v."anulada" = false
+        ${idSucursal ? Prisma.sql`AND v."sucursalId" = ${idSucursal}` : Prisma.empty}
+      GROUP BY DATE(v."fechaVenta")
+      ORDER BY "totalVentas" DESC
+      LIMIT ${safeLimit};
+    `;
+
+      const maxVenta = Math.max(...result.map((item) => item.totalVentas), 0);
+
+      const data: TopFechaIngresoItem[] = result.map((item, index) => {
+        const fecha = dayjs(item.fecha);
+
+        return {
+          ranking: index + 1,
+          fecha: fecha.format('YYYY-MM-DD'),
+          label: fecha.locale('es').format('DD MMM YYYY').toUpperCase(),
+          dia: fecha.format('DD'),
+          mes: fecha.locale('es').format('MMM').toUpperCase(),
+          anio: fecha.year(),
+          totalVentas: item.totalVentas,
+          cantidadVentas: item.cantidadVentas,
+          porcentajeBarra:
+            maxVenta > 0
+              ? Number(((item.totalVentas / maxVenta) * 100).toFixed(1))
+              : 0,
+        };
+      });
+
+      return {
+        rangoMeses: safeRango,
+        fechaInicio: dayjs(startDate).format('YYYY-MM-DD'),
+        fechaFin: dayjs(endDate).format('YYYY-MM-DD'),
         data,
       };
     } catch (error) {

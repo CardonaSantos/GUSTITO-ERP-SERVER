@@ -48,9 +48,9 @@ export class AsientoContableLinea {
       throw new Error('Debe/Haber no pueden ser negativos');
     }
 
-    if (debe === 0 && haber === 0) {
-      throw new Error('Debe o Haber debe tener valor');
-    }
+    // if (debe === 0 && haber === 0) {
+    //   throw new Error('Debe o Haber debe tener valor');
+    // }
 
     if (debe > 0 && haber > 0) {
       throw new Error('Una línea no puede tener debe y haber al mismo tiempo');
