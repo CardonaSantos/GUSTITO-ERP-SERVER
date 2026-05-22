@@ -19,6 +19,7 @@ import {
   Rol,
   RolPrecio,
   TipoPrecio,
+  TipoProductoInventario,
 } from '@prisma/client';
 import { PresentacionProductoService } from 'src/presentacion-producto/presentacion-producto.service';
 import { ProductoApi } from './dto/interfacesPromise';
@@ -56,11 +57,7 @@ export class ProductsService {
   ) {}
   private dec = (v: any): string => (v == null ? '0' : String(v));
 
-  async create(
-    dto: CreateNewProductDto,
-    imagenes: Express.Multer.File[],
-    presImages: Map<number, Express.Multer.File[]> = new Map(),
-  ) {
+  async create(dto: CreateNewProductDto, imagenes: Express.Multer.File[]) {
     try {
       const {
         codigoProducto,
@@ -71,23 +68,45 @@ export class ProductsService {
         codigoProveedor,
         descripcion,
         precioCostoActual,
-        presentaciones,
         stockMinimo,
-        tipoPresentacionId,
+        tipoInventario,
+        visibleEnPos,
       } = dto;
 
       return await this.prisma.$transaction(async (tx) => {
-        const dup = await tx.producto.findUnique({ where: { codigoProducto } });
+        const dup = await tx.producto.findUnique({
+          where: { codigoProducto },
+        });
+
         if (dup) {
           throw new BadRequestException(
             `Ya existe un producto con código "${codigoProducto}"`,
           );
         }
 
+        if (codigoProveedor) {
+          const dupProveedor = await tx.producto.findUnique({
+            where: { codigoProveedor },
+          });
+
+          if (dupProveedor) {
+            throw new BadRequestException(
+              `Ya existe un producto con código de proveedor "${codigoProveedor}"`,
+            );
+          }
+        }
+
         const costoActualNumber =
           precioCostoActual != null && String(precioCostoActual).trim() !== ''
             ? Number(precioCostoActual)
             : null;
+
+        const tipoInventarioFinal = tipoInventario ?? 'PRODUCTO_VENTA';
+
+        const visibleEnPosFinal =
+          tipoInventarioFinal === 'PRODUCTO_VENTA'
+            ? Boolean(visibleEnPos ?? true)
+            : false;
 
         const newProduct = await tx.producto.create({
           data: {
@@ -96,12 +115,13 @@ export class ProductsService {
             codigoProveedor: codigoProveedor || null,
             nombre,
             descripcion: descripcion || null,
+
+            tipoInventario: tipoInventarioFinal,
+            visibleEnPos: visibleEnPosFinal,
+
             categorias: {
               connect: categorias?.map((id) => ({ id })) ?? [],
             },
-            ...(tipoPresentacionId
-              ? { tipoPresentacion: { connect: { id: tipoPresentacionId } } }
-              : {}),
           },
         });
 
@@ -122,14 +142,15 @@ export class ProductsService {
           ),
         );
 
-        // Stock mínimo de producto
         if (stockMinimo != null) {
           await tx.stockThreshold.create({
-            data: { productoId: newProduct.id, stockMinimo },
+            data: {
+              productoId: newProduct.id,
+              stockMinimo,
+            },
           });
         }
 
-        // Imágenes del PRODUCTO
         if (imagenes?.length) {
           const uploads = await Promise.allSettled(
             imagenes.map((file) =>
@@ -138,10 +159,12 @@ export class ProductsService {
           );
 
           for (let idx = 0; idx < uploads.length; idx++) {
-            const r = uploads[idx];
+            const result = uploads[idx];
             const file = imagenes[idx];
-            if (r.status === 'fulfilled') {
-              const { url, public_id } = r.value;
+
+            if (result.status === 'fulfilled') {
+              const { url, public_id } = result.value;
+
               await this.vincularProductoImagen(
                 tx,
                 newProduct.id,
@@ -150,28 +173,25 @@ export class ProductsService {
                 file?.originalname,
               );
             } else {
-              this.logger.error(`Error subiendo imagen [${idx}]`, r.reason);
+              this.logger.error(
+                `Error subiendo imagen [${idx}]`,
+                result.reason,
+              );
             }
           }
         } else {
           this.logger.debug('No hay imágenes de producto para subir/crear');
         }
 
-        const createdPresentations = await this.presentacionPrducto.create(
-          tx,
-          presentaciones ?? [],
-          newProduct.id,
-          presImages,
-          creadoPorId,
-        );
-
         return {
           newProduct,
-          presentaciones: createdPresentations,
         };
       });
     } catch (error) {
       this.logger.error('Error al crear producto:', error);
+
+      if (error instanceof HttpException) throw error;
+
       throw new InternalServerErrorException(
         'No se pudo crear el producto y sus datos asociados',
       );
@@ -314,13 +334,31 @@ export class ProductsService {
       const limit = Math.min(Math.max(1, Number(dto.limit) || 20), 100);
       const skip = (page - 1) * limit;
 
+      /**
+       * Productos vendibles del POS.
+       * Estos sí van paginados y sí reciben filtros/search.
+       */
       const whereProducto: Prisma.ProductoWhereInput = {
         activo: true,
+        eliminado: false,
+        tipoInventario: 'PRODUCTO_VENTA',
+        visibleEnPos: true,
       };
 
       this.asignePropsWhereInput(dto, whereProducto);
 
-      const [totalProducts, products] = await Promise.all([
+      /**
+       * Empaques.
+       * No los mezclamos con la paginación del POS.
+       * No deben depender del search de productos.
+       */
+      const whereEmpaques: Prisma.ProductoWhereInput = {
+        activo: true,
+        eliminado: false,
+        tipoInventario: 'EMPAQUE',
+      };
+
+      const [totalProducts, products, empaquesRaw] = await Promise.all([
         this.prisma.producto.count({
           where: whereProducto,
         }),
@@ -334,10 +372,22 @@ export class ProductsService {
             id: 'asc',
           },
         }),
+
+        this.prisma.producto.findMany({
+          where: whereEmpaques,
+          select: productoSelect,
+          orderBy: {
+            nombre: 'asc',
+          },
+        }),
       ]);
 
       const productsArray = Array.isArray(products)
         ? this.normalizerProductsInventario(products, dto.sucursalId)
+        : [];
+
+      const empaquesArray = Array.isArray(empaquesRaw)
+        ? this.normalizerProductsInventario(empaquesRaw, dto.sucursalId)
         : [];
 
       const totalPages = Math.max(1, Math.ceil(totalProducts / limit));
@@ -347,6 +397,12 @@ export class ProductsService {
           ...producto,
           __source: 'producto',
         })),
+
+        empaques: empaquesArray.map((producto) => ({
+          ...producto,
+          __source: 'empaque',
+        })),
+
         meta: {
           totalCount: totalProducts,
           totalPages,
@@ -354,6 +410,7 @@ export class ProductsService {
           limit,
           totals: {
             productos: totalProducts,
+            empaques: empaquesArray.length,
           },
         },
       };
@@ -1384,62 +1441,6 @@ export class ProductsService {
     });
   }
 
-  //SEEED
-  async seedProductosBasicos(creadoPorId: number) {
-    const report: Array<{
-      codigoProducto: string;
-      status: 'created' | 'skipped' | 'error';
-      error?: string;
-    }> = [];
-
-    for (const base of itemsBase) {
-      // Idempotencia por codigoProducto
-      const exists = await this.prisma.producto.findUnique({
-        where: { codigoProducto: base.codigoProducto },
-        select: { id: true },
-      });
-
-      if (exists) {
-        report.push({ codigoProducto: base.codigoProducto, status: 'skipped' });
-        continue;
-      }
-
-      try {
-        await this.create(
-          {
-            ...base,
-            creadoPorId,
-            precioCostoActual:
-              base.precioCostoActual != null
-                ? String(base.precioCostoActual)
-                : undefined,
-          },
-          [], // sin imágenes de PRODUCTO
-          new Map(), // sin imágenes de PRESENTACIONES
-        );
-        report.push({ codigoProducto: base.codigoProducto, status: 'created' });
-      } catch (e: any) {
-        this.logger.error(
-          `Error creando ${base.codigoProducto}: ${e?.message ?? e}`,
-        );
-        report.push({
-          codigoProducto: base.codigoProducto,
-          status: 'error',
-          error: e?.message ?? String(e),
-        });
-      }
-    }
-
-    const summary = {
-      created: report.filter((r) => r.status === 'created').length,
-      skipped: report.filter((r) => r.status === 'skipped').length,
-      errors: report.filter((r) => r.status === 'error').length,
-      details: report,
-    };
-
-    return summary;
-  }
-
   //SERVICIOS DE EDICION DE PRODUCTO - GET Y PATCH
   async getProductToEdit(productId: number) {
     try {
@@ -1460,7 +1461,6 @@ export class ProductsService {
       where: { id },
       include: {
         categorias: true,
-        tipoPresentacion: true,
         imagenesProducto: true,
         precios: {
           orderBy: { orden: 'asc' },
@@ -1468,7 +1468,9 @@ export class ProductsService {
             estado: 'APROBADO',
             OR: [
               { tipo: { not: 'CREADO_POR_SOLICITUD' } },
-              { AND: [{ tipo: 'CREADO_POR_SOLICITUD' }, { usado: false }] }, // temporales solo si no usados
+              {
+                AND: [{ tipo: 'CREADO_POR_SOLICITUD' }, { usado: false }],
+              },
             ],
           },
         },
@@ -1477,33 +1479,12 @@ export class ProductsService {
             stockMinimo: true,
           },
         },
-        presentaciones: {
-          include: {
-            categorias: true,
-            tipoPresentacion: true,
-            imagenesPresentacion: true,
-            precios: {
-              orderBy: { orden: 'asc' },
-              where: {
-                estado: 'APROBADO',
-                OR: [
-                  { tipo: { not: 'CREADO_POR_SOLICITUD' } },
-                  { AND: [{ tipo: 'CREADO_POR_SOLICITUD' }, { usado: false }] }, // temporales solo si no usados
-                ],
-              },
-            },
-            stockThresholdPresentacion: {
-              select: {
-                stockMinimo: true,
-              },
-            },
-          },
-          orderBy: { id: 'asc' },
-        },
       },
     });
 
-    if (!p) throw new NotFoundException('Producto no encontrado');
+    if (!p) {
+      throw new NotFoundException('Producto no encontrado');
+    }
 
     const data = {
       id: p.id,
@@ -1512,18 +1493,19 @@ export class ProductsService {
       codigoProveedor: p.codigoProveedor,
       descripcion: p.descripcion,
 
-      // mejor como número para el input
+      // NUEVO: flags operativas
+      tipoInventario: p.tipoInventario,
+      visibleEnPos: p.visibleEnPos,
+
+      // Mejor como número para el input
       precioCostoActual: Number(p.precioCostoActual ?? 0),
 
-      // 🔹 nuevo: expón stockMinimo de producto
       stockMinimo: p.stockThreshold?.stockMinimo ?? 0,
 
-      categorias: p.categorias.map(({ id, nombre }) => ({ id, nombre })),
-      tipoPresentacionId: p.tipoPresentacionId,
-      tipoPresentacion: p.tipoPresentacion && {
-        id: p.tipoPresentacion.id,
-        nombre: p.tipoPresentacion.nombre,
-      },
+      categorias: p.categorias.map(({ id, nombre }) => ({
+        id,
+        nombre,
+      })),
 
       imagenesProducto: p.imagenesProducto.map((i) => ({
         id: i.id,
@@ -1535,40 +1517,10 @@ export class ProductsService {
       precios: p.precios.map((x) => ({
         rol: x.rol,
         orden: x.orden,
-        precio: this.dec(x.precio), // string ok para el UI
-      })),
-
-      presentaciones: p.presentaciones.map((sp) => ({
-        id: sp.id,
-        nombre: sp.nombre,
-        codigoBarras: sp.codigoBarras,
-        tipoPresentacionId: sp.tipoPresentacionId,
-        tipoPresentacion: sp.tipoPresentacion && {
-          id: sp.tipoPresentacion.id,
-          nombre: sp.tipoPresentacion.nombre,
-        },
-        costoReferencialPresentacion: this.dec(sp.costoReferencialPresentacion),
-        descripcion: sp.descripcion,
-
-        // 🔧 null-safe
-        stockMinimo: sp.stockThresholdPresentacion?.stockMinimo ?? 0,
-
-        precios: sp.precios.map((px) => ({
-          rol: px.rol,
-          orden: px.orden,
-          precio: this.dec(px.precio),
-        })),
-        esDefault: !!sp.esDefault,
-        imagenesPresentacion: sp.imagenesPresentacion.map((i) => ({
-          id: i.id,
-          url: i.url,
-          public_id: i.public_id,
-          name: i.altTexto ?? null,
-        })),
-        activo: !!sp.activo,
-        categorias: sp.categorias.map(({ id, nombre }) => ({ id, nombre })),
+        precio: this.dec(x.precio),
       })),
     };
+
     this.logger.log(
       `La data a retornar al formulario de edicion de producto es:\n${JSON.stringify(data, null, 2)}`,
     );
@@ -1714,85 +1666,107 @@ export class ProductsService {
       precioCostoActual: string | null;
       creadoPorId: number;
       categorias: number[];
-      tipoPresentacionId: number | null;
       precioVenta: { rol: RolPrecio; orden: number; precio: string }[];
-      presentaciones: Array<{
-        id: number | null;
-        nombre: string;
-        codigoBarras?: string;
-        esDefault: boolean;
-        tipoPresentacionId: number | null;
-        costoReferencialPresentacion: string | null;
-        descripcion: string | null;
-        stockMinimo: number | null;
-        categoriaIds: number[];
-        preciosPresentacion: {
-          rol: RolPrecio;
-          orden: number;
-          precio: string;
-        }[];
-        activo?: boolean;
-      }>;
-      deletedPresentationIds?: number[];
+
+      tipoInventario: TipoProductoInventario;
+      visibleEnPos: boolean;
+
       keepProductImageIds?: number[];
-      keepPresentationImageIds?: Record<number, number[]>;
     },
     productImages: Express.Multer.File[],
-    presImagesByIndex: Map<number, Express.Multer.File[]>,
   ) {
     this.logger.log(
-      `DTO recibido para editar producto y presentacion con sus props:\n${JSON.stringify(
-        dto,
-        null,
-        2,
-      )}`,
+      `DTO recibido para editar producto:\n${JSON.stringify(dto, null, 2)}`,
     );
 
     this.logger.debug(`[update] productImages=${productImages.length}`);
-    this.logger.debug(
-      `[update] presImages indexes: ${
-        Array.from(presImagesByIndex.keys()).join(', ') || '(none)'
-      }`,
-    );
-    for (const [i, list] of presImagesByIndex) {
-      this.logger.debug(
-        `  pres[${i}] files=${list.length} -> ${list
-          .map((f) => f.originalname)
-          .join(', ')}`,
-      );
-    }
-    const keepKeys =
-      dto.keepPresentationImageIds &&
-      Object.keys(dto.keepPresentationImageIds).join(', ');
-    this.logger.debug(
-      `[update] keepPresentationImageIds keys: ${keepKeys || '(none)'}`,
-    );
 
     return this.prisma.$transaction(async (tx) => {
-      // 1) existencia
+      // 1) Existencia
       const exists = await tx.producto.findUnique({
         where: { id: productId },
-        select: { id: true },
+        select: {
+          id: true,
+          codigoProducto: true,
+          codigoProveedor: true,
+        },
       });
-      if (!exists) throw new NotFoundException('Producto no encontrado');
 
-      // 2) update producto base
+      if (!exists) {
+        throw new NotFoundException('Producto no encontrado');
+      }
+
+      // 2) Validar código producto duplicado
+      if (dto.codigoProducto && dto.codigoProducto !== exists.codigoProducto) {
+        const dupCodigoProducto = await tx.producto.findFirst({
+          where: {
+            codigoProducto: dto.codigoProducto,
+            id: { not: productId },
+          },
+          select: { id: true },
+        });
+
+        if (dupCodigoProducto) {
+          throw new BadRequestException(
+            `Ya existe otro producto con código "${dto.codigoProducto}"`,
+          );
+        }
+      }
+
+      // 3) Validar código proveedor duplicado, solo si viene
+      if (
+        dto.codigoProveedor &&
+        dto.codigoProveedor !== exists.codigoProveedor
+      ) {
+        const dupCodigoProveedor = await tx.producto.findFirst({
+          where: {
+            codigoProveedor: dto.codigoProveedor,
+            id: { not: productId },
+          },
+          select: { id: true },
+        });
+
+        if (dupCodigoProveedor) {
+          throw new BadRequestException(
+            `Ya existe otro producto con código de proveedor "${dto.codigoProveedor}"`,
+          );
+        }
+      }
+
+      const costoActualNumber =
+        dto.precioCostoActual != null &&
+        String(dto.precioCostoActual).trim() !== ''
+          ? Number(dto.precioCostoActual)
+          : null;
+
+      const tipoInventarioFinal =
+        dto.tipoInventario ?? TipoProductoInventario.PRODUCTO_VENTA;
+
+      const visibleEnPosFinal =
+        tipoInventarioFinal === TipoProductoInventario.PRODUCTO_VENTA
+          ? Boolean(dto.visibleEnPos ?? true)
+          : false;
+
+      // 4) Update producto base
       await tx.producto.update({
         where: { id: productId },
         data: {
           nombre: dto.nombre,
-          descripcion: dto.descripcion,
+          descripcion: dto.descripcion || null,
           codigoProducto: dto.codigoProducto,
-          codigoProveedor: dto.codigoProveedor,
-          precioCostoActual: dto.precioCostoActual
-            ? Number(dto.precioCostoActual)
-            : null,
-          tipoPresentacionId: dto.tipoPresentacionId,
-          categorias: { set: dto.categorias.map((id) => ({ id })) },
+          codigoProveedor: dto.codigoProveedor || null,
+          precioCostoActual: costoActualNumber,
+
+          tipoInventario: tipoInventarioFinal,
+          visibleEnPos: visibleEnPosFinal,
+
+          categorias: {
+            set: dto.categorias.map((id) => ({ id })),
+          },
         },
       });
 
-      // 3) stockThreshold producto
+      // 5) Stock mínimo del producto
       if (dto.stockMinimo === null) {
         await tx.stockThreshold.deleteMany({
           where: { productoId: productId },
@@ -1800,7 +1774,9 @@ export class ProductsService {
       } else {
         const current = await tx.stockThreshold.findFirst({
           where: { productoId: productId },
+          select: { id: true },
         });
+
         if (current) {
           await tx.stockThreshold.update({
             where: { id: current.id },
@@ -1808,19 +1784,25 @@ export class ProductsService {
           });
         } else {
           await tx.stockThreshold.create({
-            data: { productoId: productId, stockMinimo: dto.stockMinimo },
+            data: {
+              productoId: productId,
+              stockMinimo: dto.stockMinimo,
+            },
           });
         }
       }
 
-      // 4) precios del producto (versionado)
+      // 6) Precios del producto - versionado
       await tx.precioProducto.updateMany({
         where: {
           productoId: productId,
           estado: EstadoPrecio.APROBADO,
           vigenteHasta: null,
         },
-        data: { estado: EstadoPrecio.RECHAZADO, vigenteHasta: new Date() },
+        data: {
+          estado: EstadoPrecio.RECHAZADO,
+          vigenteHasta: new Date(),
+        },
       });
 
       if (dto.precioVenta?.length) {
@@ -1834,188 +1816,57 @@ export class ProductsService {
             estado: EstadoPrecio.APROBADO,
             vigenteDesde: new Date(),
             vigenteHasta: null,
+            creadoPorId: dto.creadoPorId,
           })),
         });
       }
 
-      // 5) imágenes del producto
-      // BORRAR solo si el front envía keepProductImageIds (si no, no tocamos nada)
+      // 7) Imágenes del producto
+      // Solo borra si el frontend envía keepProductImageIds.
+      // Si no lo envía, no tocamos las imágenes existentes.
       if (Array.isArray(dto.keepProductImageIds)) {
-        const existing = await tx.imagenProducto.findMany({
+        const existingImages = await tx.imagenProducto.findMany({
           where: { productoId: productId },
-          select: { id: true, public_id: true },
+          select: {
+            id: true,
+            public_id: true,
+          },
         });
+
         const keepSet = new Set(dto.keepProductImageIds);
-        const toDelete = existing.filter((x) => !keepSet.has(x.id));
-        if (toDelete.length) {
+
+        const imagesToDelete = existingImages.filter(
+          (img) => !keepSet.has(img.id),
+        );
+
+        if (imagesToDelete.length) {
           await Promise.allSettled(
-            toDelete
-              .filter((x) => !!x.public_id)
-              .map((x) => this.cloudinaryService.BorrarImagen(x.public_id!)),
+            imagesToDelete
+              .filter((img) => !!img.public_id)
+              .map((img) =>
+                this.cloudinaryService.BorrarImagen(img.public_id!),
+              ),
           );
+
           await tx.imagenProducto.deleteMany({
-            where: { id: { in: toDelete.map((x) => x.id) } },
+            where: {
+              id: {
+                in: imagesToDelete.map((img) => img.id),
+              },
+            },
           });
         }
       }
-      // subir nuevas imágenes de producto (si hay)
+
+      // 8) Subir nuevas imágenes del producto
       await this.uploadAndSaveProductImages(tx, productId, productImages);
 
-      // 6) presentaciones eliminadas (si llegan) — limpia Cloudinary y DB
-      if (dto.deletedPresentationIds?.length) {
-        const imgsToDelete = await tx.imagenPresentacion.findMany({
-          where: { presentacionId: { in: dto.deletedPresentationIds } },
-          select: { id: true, public_id: true },
-        });
-        if (imgsToDelete.length) {
-          await Promise.allSettled(
-            imgsToDelete
-              .filter((x) => !!x.public_id)
-              .map((x) => this.cloudinaryService.BorrarImagen(x.public_id!)),
-          );
-        }
-        await tx.productoPresentacion.deleteMany({
-          where: {
-            id: { in: dto.deletedPresentationIds },
-            productoId: productId,
-          },
-        });
-      }
-
-      // 7) upsert presentaciones + stock + precios + imágenes
-      const keepMap = dto.keepPresentationImageIds; // undefined => no borrar nada existente
-
-      for (let i = 0; i < (dto.presentaciones?.length ?? 0); i++) {
-        const p = dto.presentaciones[i];
-        let presId = p.id ?? null;
-
-        if (presId == null) {
-          // create
-          const created = await tx.productoPresentacion.create({
-            data: {
-              productoId: productId,
-              nombre: p.nombre,
-              codigoBarras: p.codigoBarras || null,
-              esDefault: p.esDefault,
-              tipoPresentacionId: p.tipoPresentacionId,
-              costoReferencialPresentacion: p.costoReferencialPresentacion
-                ? new Prisma.Decimal(p.costoReferencialPresentacion)
-                : null,
-              descripcion: p.descripcion,
-              activo: p.activo ?? true,
-              categorias: { connect: p.categoriaIds.map((id) => ({ id })) },
-            },
-            select: { id: true },
-          });
-          presId = created.id;
-        } else {
-          // update
-          await tx.productoPresentacion.update({
-            where: { id: presId, productoId: productId },
-            data: {
-              nombre: p.nombre,
-              codigoBarras: p.codigoBarras || null,
-              esDefault: p.esDefault,
-              tipoPresentacionId: p.tipoPresentacionId,
-              costoReferencialPresentacion: p.costoReferencialPresentacion
-                ? new Prisma.Decimal(p.costoReferencialPresentacion)
-                : null,
-              descripcion: p.descripcion,
-              activo: p.activo ?? true,
-              categorias: { set: p.categoriaIds.map((id) => ({ id })) },
-            },
-          });
-        }
-
-        // stockThresholdPresentacion
-        if (p.stockMinimo === null) {
-          await tx.stockThresholdPresentacion.deleteMany({
-            where: { presentacionId: presId },
-          });
-        } else {
-          const cur = await tx.stockThresholdPresentacion.findFirst({
-            where: { presentacionId: presId },
-          });
-          if (cur) {
-            await tx.stockThresholdPresentacion.update({
-              where: { id: cur.id },
-              data: { stockMinimo: p.stockMinimo },
-            });
-          } else {
-            await tx.stockThresholdPresentacion.create({
-              data: { presentacionId: presId, stockMinimo: p.stockMinimo },
-            });
-          }
-        }
-
-        // precios de la presentación (replace)
-        await tx.precioProducto.updateMany({
-          where: {
-            presentacionId: presId,
-            estado: EstadoPrecio.APROBADO,
-            vigenteHasta: null,
-          },
-          data: { estado: EstadoPrecio.RECHAZADO, vigenteHasta: new Date() },
-        });
-
-        if (p.preciosPresentacion?.length) {
-          await tx.precioProducto.createMany({
-            data: p.preciosPresentacion.map((pp) => ({
-              presentacionId: presId,
-              rol: pp.rol,
-              orden: pp.orden,
-              precio: new Prisma.Decimal(pp.precio),
-              tipo: TipoPrecio.ESTANDAR,
-              estado: EstadoPrecio.APROBADO,
-              vigenteDesde: new Date(),
-              vigenteHasta: null,
-            })),
-          });
-        }
-
-        // imágenes de la presentación:
-        // BORRAR solo si el front envió una entrada para este presId
-        if (keepMap && Object.prototype.hasOwnProperty.call(keepMap, presId)) {
-          const keepForThis = keepMap[presId] || []; // [] => borra todas
-          const existingImgs = await tx.imagenPresentacion.findMany({
-            where: { presentacionId: presId },
-            select: { id: true, public_id: true },
-          });
-          const keepSetPres = new Set(keepForThis);
-          const del = existingImgs.filter((img) => !keepSetPres.has(img.id));
-          if (del.length) {
-            await Promise.allSettled(
-              del
-                .filter((x) => !!x.public_id)
-                .map((x) => this.cloudinaryService.BorrarImagen(x.public_id!)),
-            );
-            await tx.imagenPresentacion.deleteMany({
-              where: { id: { in: del.map((x) => x.id) } },
-            });
-          }
-        }
-
-        // subir nuevas imágenes de esta presentación (por índice i)
-        const newFiles = presImagesByIndex.get(i) ?? [];
-        await this.uploadAndSavePresentationImages(tx, presId, newFiles);
-      }
-
-      // 8) asegurar una sola default
-      const defaults = await tx.productoPresentacion.count({
-        where: { productoId: productId, esDefault: true },
-      });
-      if (defaults > 1) {
-        const firstDefault = await tx.productoPresentacion.findFirst({
-          where: { productoId: productId, esDefault: true },
-          orderBy: { id: 'asc' },
-        });
-        await tx.productoPresentacion.updateMany({
-          where: { productoId: productId, id: { not: firstDefault?.id } },
-          data: { esDefault: false },
-        });
-      }
-
-      return { ok: true, id: productId };
+      return {
+        ok: true,
+        id: productId,
+        tipoInventario: tipoInventarioFinal,
+        visibleEnPos: visibleEnPosFinal,
+      };
     });
   }
 }

@@ -1,4 +1,4 @@
-import { RolPrecio } from '@prisma/client';
+import { RolPrecio, TipoProductoInventario } from '@prisma/client';
 import {
   IsArray,
   IsBoolean,
@@ -98,6 +98,14 @@ export class PresentacionCreateDto {
 // --------- DTO principal ---------
 
 export class CreateNewProductDto {
+  @IsOptional()
+  @IsEnum(TipoProductoInventario)
+  tipoInventario?: TipoProductoInventario;
+
+  @IsOptional()
+  @IsBoolean()
+  visibleEnPos?: boolean;
+
   @IsString()
   @Length(1, 255)
   nombre: string;

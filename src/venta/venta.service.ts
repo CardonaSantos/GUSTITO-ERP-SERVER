@@ -11,7 +11,13 @@ import { UpdateVentaDto } from './dto/update-venta.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ClientService } from 'src/client/client.service';
 import { NotificationService } from 'src/notification/notification.service';
-import { EstadoPrecio, MetodoPago, Prisma, Rol } from '@prisma/client';
+import {
+  EstadoPrecio,
+  MetodoPago,
+  Prisma,
+  Rol,
+  TipoProductoInventario,
+} from '@prisma/client';
 import { HistorialStockTrackerService } from 'src/historial-stock-tracker/historial-stock-tracker.service';
 import { CajaService } from 'src/caja/caja.service';
 import { SelectTypeVentas } from './select/selecSalesType';
@@ -61,7 +67,8 @@ export class VentaService {
       sucursalId,
       clienteId,
       productos,
-      metodoPago, // método que viene del payload
+      empaques = [],
+      metodoPago,
       nombre,
       dpi,
       telefono,
@@ -211,6 +218,60 @@ export class VentaService {
         );
       }
 
+      // ----------------------------------------------------------------
+      // 3.1) Empaques: se procesan como salida de stock de producto,
+      //      pero sin precio, sin selectedPriceId y sin afectar total.
+      // ----------------------------------------------------------------
+      for (const empaque of empaques ?? []) {
+        const productoId = Number(empaque.productoId);
+        const cantidad = Number(empaque.cantidad ?? 0);
+
+        if (!Number.isFinite(productoId) || productoId <= 0) {
+          throw new BadRequestException('Producto de empaque inválido.');
+        }
+
+        if (!Number.isFinite(cantidad) || cantidad <= 0) {
+          throw new BadRequestException(
+            `Cantidad inválida para empaque #${productoId}.`,
+          );
+        }
+
+        const productoEmpaque = await tx.producto.findUnique({
+          where: { id: productoId },
+          select: {
+            id: true,
+            nombre: true,
+            activo: true,
+            eliminado: true,
+            tipoInventario: true,
+          },
+        });
+
+        if (!productoEmpaque) {
+          throw new BadRequestException(`Empaque #${productoId} no existe.`);
+        }
+
+        if (!productoEmpaque.activo || productoEmpaque.eliminado) {
+          throw new BadRequestException(
+            `El empaque "${productoEmpaque.nombre}" no está activo.`,
+          );
+        }
+
+        if (productoEmpaque.tipoInventario !== TipoProductoInventario.EMPAQUE) {
+          throw new BadRequestException(
+            `El producto "${productoEmpaque.nombre}" no está marcado como EMPAQUE.`,
+          );
+        }
+
+        prodValidadas.push({
+          productoId,
+          cantidad,
+          precioVenta: new Prisma.Decimal(0),
+          tipoPrecio: 'CONSUMO_EMPAQUE_VENTA',
+          selectedPriceId: 0,
+        });
+      }
+
       // Consolidar (productoId,selectedPriceId) y (presentacionId,selectedPriceId)
       const keyProd = (x: LineaProd) => `${x.productoId}|${x.selectedPriceId}`;
       const keyPres = (x: LineaPres) =>
@@ -268,7 +329,7 @@ export class VentaService {
           ...prodConsolidadas.map((x) => x.selectedPriceId),
           ...presConsolidadas.map((x) => x.selectedPriceId),
         ]),
-      );
+      ).filter((id) => Number.isFinite(Number(id)) && Number(id) > 0);
 
       // si no hay precios seleccionados, evita ir a DB
       if (allSelectedIds.length) {
@@ -860,7 +921,7 @@ export class VentaService {
         where: { id },
         include: {
           cliente: true,
-          metodoPago: true, // puede ser objeto o array según tu modelo
+          metodoPago: true,
           sucursal: {
             select: {
               direccion: true,
@@ -872,13 +933,13 @@ export class VentaService {
           },
           productos: {
             include: {
-              // 👇 incluimos ambas caras para poder normalizar
               producto: {
                 select: {
                   id: true,
                   nombre: true,
                   descripcion: true,
                   codigoProducto: true,
+                  tipoInventario: true,
                   creadoEn: true,
                   actualizadoEn: true,
                 },
@@ -901,7 +962,14 @@ export class VentaService {
 
       if (!venta) return null;
 
-      return normalizeVentaForPDF(venta);
+      const ventaSinEmpaques = {
+        ...venta,
+        productos: venta.productos.filter((line) => {
+          return line.producto?.tipoInventario !== 'EMPAQUE';
+        }),
+      };
+
+      return normalizeVentaForPDF(ventaSinEmpaques);
     } catch (error) {
       console.error(error);
       throw new InternalServerErrorException('Error al obtener la venta');
