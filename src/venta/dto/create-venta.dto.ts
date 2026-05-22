@@ -7,7 +7,19 @@ import {
   IsInt,
   IsString,
   IsOptional,
+  ValidateNested,
+  Min,
 } from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class EmpaqueVentaDto {
+  @IsInt()
+  productoId: number;
+
+  @IsNumber()
+  @Min(1)
+  cantidad: number;
+}
 
 export class CreateVentaDto {
   @IsDate()
@@ -23,7 +35,7 @@ export class CreateVentaDto {
 
   @IsNumber()
   @IsOptional()
-  clienteId?: number; // Si es un cliente existente
+  clienteId?: number;
 
   @IsOptional()
   @IsString()
@@ -31,7 +43,7 @@ export class CreateVentaDto {
 
   @IsNumber()
   @IsOptional()
-  usuarioId?: number; // Si es un cliente existente
+  usuarioId?: number;
 
   @IsString()
   @IsOptional()
@@ -63,12 +75,19 @@ export class CreateVentaDto {
 
   @IsArray()
   productos: Array<{
-    productoId?: number; // 👈 ahora opcional
+    productoId?: number;
     cantidad: number;
     selectedPriceId: number;
     presentacionId?: number | null;
     precioSeleccionadoId?: number;
   }>;
+
+  // NUEVO: consumibles sin precio
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => EmpaqueVentaDto)
+  empaques?: EmpaqueVentaDto[];
 
   @IsEnum(MetodoPago)
   metodoPago: MetodoPago;
@@ -81,7 +100,7 @@ export class CreateVentaDto {
 
   @IsString()
   @IsOptional()
-  imei?: string; // Campo opcional para IMEI
+  imei?: string;
 
   @IsString()
   @IsOptional()

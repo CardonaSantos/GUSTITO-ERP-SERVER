@@ -28,7 +28,7 @@ import {
   FilesInterceptor,
 } from '@nestjs/platform-express';
 import { join } from 'path';
-import { RolPrecio } from '@prisma/client';
+import { RolPrecio, TipoProductoInventario } from '@prisma/client';
 import { plainToInstance } from 'class-transformer';
 import { validateOrReject } from 'class-validator';
 import { QueryParamsInventariado } from './query/query';
@@ -72,14 +72,12 @@ interface UpdateProductDto {
   precioCostoActual: string | null;
   creadoPorId: number;
   categorias: number[];
-  tipoPresentacionId: number | null;
   precioVenta: PrecioProductoDto[];
-  presentaciones: PresentacionUpdateDto[];
 
-  //nuevo
-  deletedPresentationIds?: number[];
+  tipoInventario: TipoProductoInventario;
+  visibleEnPos: boolean;
+
   keepProductImageIds?: number[];
-  keepPresentationImageIds?: Record<number, number[]>;
 }
 
 // -------- Helpers de parsing/validación --------
@@ -223,6 +221,51 @@ export function mapPresentacionesArray(arr: any[]): PresentacionCreateDto[] {
   });
 }
 
+function toBooleanOrDefault(value: unknown, defaultValue: boolean): boolean {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+
+  if (typeof value === 'boolean') return value;
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (['true', '1', 'yes', 'si', 'sí', 'on'].includes(normalized)) {
+    return true;
+  }
+
+  if (['false', '0', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+
+  throw new BadRequestException(`Valor booleano inválido: ${value}`);
+}
+
+function toTipoInventarioOrDefault(value: unknown): TipoProductoInventario {
+  const raw = cleanStr(value) || TipoProductoInventario.PRODUCTO_VENTA;
+
+  if (
+    Object.values(TipoProductoInventario).includes(
+      raw as TipoProductoInventario,
+    )
+  ) {
+    return raw as TipoProductoInventario;
+  }
+
+  throw new BadRequestException(`Tipo de inventario inválido: ${raw}`);
+}
+
+function resolveVisibleEnPos(
+  tipoInventario: TipoProductoInventario,
+  value: unknown,
+): boolean {
+  if (tipoInventario !== TipoProductoInventario.PRODUCTO_VENTA) {
+    return false;
+  }
+
+  return toBooleanOrDefault(value, true);
+}
+
 @Controller('products')
 export class ProductsController {
   private readonly logger = new Logger(ProductsController.name);
@@ -239,18 +282,7 @@ export class ProductsController {
     @UploadedFiles() files: Express.Multer.File[],
     @Body() body: Record<string, any>,
   ) {
-    this.logger.debug(
-      'RAW presentaciones:',
-      typeof body.presentaciones,
-      body.presentaciones?.slice?.(0, 200),
-    );
-
-    const parsed = safeJsonParse<any[]>(
-      body.presentaciones,
-      [],
-      'presentaciones',
-    );
-    this.logger.debug('Parsed p[0] keys:', Object.keys(parsed?.[0] ?? {}));
+    const tipoInventario = toTipoInventarioOrDefault(body.tipoInventario);
 
     const dtoPlain: Partial<CreateNewProductDto> = {
       nombre: cleanStr(body.nombre),
@@ -264,30 +296,22 @@ export class ProductsController {
       ),
       creadoPorId: toIntOrThrow(body.creadoPorId, 'creadoPorId'),
       categorias: safeJsonParse<number[]>(body.categorias, [], 'categorias'),
-      tipoPresentacionId: toNullableInt(body.tipoPresentacionId),
+
       precioVenta: mapPrecioProductoArray(
         safeJsonParse<any[]>(body.precioVenta, [], 'precioVenta'),
         'precioVenta',
       ),
-      presentaciones: mapPresentacionesArray(
-        safeJsonParse<any[]>(body.presentaciones, [], 'presentaciones'),
-      ),
+
+      tipoInventario,
+      visibleEnPos: resolveVisibleEnPos(tipoInventario, body.visibleEnPos),
     };
 
     const dto = plainToInstance(CreateNewProductDto, dtoPlain);
+    this.logger.log(`INFO NUEVO PRODUCTO:\n${JSON.stringify(dto, null, 2)}`);
     await validateOrReject(dto, {
       whitelist: true,
       forbidNonWhitelisted: true,
     });
-
-    const defaults = (dto.presentaciones ?? []).filter(
-      (p) => p.esDefault,
-    ).length;
-    if (defaults > 1) {
-      throw new BadRequestException(
-        'Solo puede haber una presentación por defecto',
-      );
-    }
 
     for (const f of files) {
       this.logger.debug(
@@ -297,17 +321,7 @@ export class ProductsController {
 
     const productImages = files.filter((f) => f.fieldname === 'images');
 
-    const presImages = new Map<number, Express.Multer.File[]>();
-    for (const f of files) {
-      const m = /^presentaciones\[(\d+)\]\.images$/.exec(f.fieldname);
-      if (m) {
-        const idx = Number(m[1]);
-        if (!presImages.has(idx)) presImages.set(idx, []);
-        presImages.get(idx)!.push(f);
-      }
-    }
-
-    return this.productsService.create(dto, productImages, presImages);
+    return this.productsService.create(dto, productImages);
   }
 
   /** POS (búsqueda y filtros) */
@@ -383,13 +397,6 @@ export class ProductsController {
     // return await this.productsService.loadCSVandImportProducts(ruta);
   }
 
-  /** Seed */
-  @Get('productos-basicos-gt')
-  async run(@Query('creadoPorId', ParseIntPipe) creadoPorId = '1') {
-    const uid = Number(creadoPorId) || 1;
-    return this.productsService.seedProductosBasicos(uid);
-  }
-
   /** Search */
   @Get('search')
   async getBySearchProducts(
@@ -411,7 +418,9 @@ export class ProductsController {
   /** PATCH catch-all por id (con FilesInterceptor simple) */
   @Patch(':id')
   @UseInterceptors(
-    AnyFilesInterceptor({ limits: { fileSize: 5 * 1024 * 1024 } }),
+    AnyFilesInterceptor({
+      limits: { fileSize: 5 * 1024 * 1024 },
+    }),
   )
   async update(
     @Param('id', ParseIntPipe) id: number,
@@ -427,7 +436,10 @@ export class ProductsController {
           )
           .join(', '),
     );
+
     const has = (k: string) => Object.prototype.hasOwnProperty.call(body, k);
+
+    const tipoInventario = toTipoInventarioOrDefault(body.tipoInventario);
 
     const dtoPlain: UpdateProductDto = {
       nombre: cleanStr(body.nombre),
@@ -441,16 +453,15 @@ export class ProductsController {
       ),
       creadoPorId: toIntOrThrow(body.creadoPorId, 'creadoPorId'),
       categorias: safeJsonParse<number[]>(body.categorias, [], 'categorias'),
-      tipoPresentacionId: toNullableInt(body.tipoPresentacionId),
+
       precioVenta: mapPrecioProductoArray(
         safeJsonParse<any[]>(body.precioVenta, [], 'precioVenta'),
         'precioVenta',
       ),
-      presentaciones: mapPresentacionesArrayUpdate(
-        safeJsonParse<any[]>(body.presentaciones, [], 'presentaciones'),
-      ),
 
-      //nuevo imagenes
+      tipoInventario,
+      visibleEnPos: resolveVisibleEnPos(tipoInventario, body.visibleEnPos),
+
       keepProductImageIds: has('keepProductImageIds')
         ? safeJsonParse<number[]>(
             body.keepProductImageIds,
@@ -458,56 +469,16 @@ export class ProductsController {
             'keepProductImageIds',
           )
         : undefined,
-
-      keepPresentationImageIds: has('keepPresentationImageIds')
-        ? safeJsonParse<Record<number, number[]>>(
-            body.keepPresentationImageIds,
-            {},
-            'keepPresentationImageIds',
-          )
-        : undefined,
-
-      deletedPresentationIds: has('deletedPresentationIds')
-        ? safeJsonParse<number[]>(
-            body.deletedPresentationIds,
-            [],
-            'deletedPresentationIds',
-          )
-        : undefined,
     };
 
-    // Agrupar archivos
     const productImages = files.filter((f) => f.fieldname === 'images');
-    const presImages = new Map<number, Express.Multer.File[]>();
-    for (const f of files) {
-      const m = /^presentaciones\[(\d+)\]\.images$/.exec(f.fieldname);
-      if (m) {
-        const idx = Number(m[1]);
-        if (!presImages.has(idx)) presImages.set(idx, []);
-        presImages.get(idx)!.push(f);
-      }
-    }
-
-    // Validaciones adicionales (ej: una sola default)
-    const defaults = dtoPlain.presentaciones.filter((p) => p.esDefault).length;
-    if (defaults > 1)
-      throw new BadRequestException(
-        'Solo puede haber una presentación por defecto',
-      );
 
     this.logger.debug(`productImages: ${productImages.length}`);
-    this.logger.debug(
-      `presImages indexes: ${Array.from(presImages.keys()).join(', ') || '(none)'}`,
-    );
-    for (const [idx, list] of presImages) {
-      this.logger.debug(
-        `  pres[${idx}] files: ${list.length} -> ` +
-          list.map((f) => f.originalname).join(', '),
-      );
-    }
 
-    // delegar al servicio
-    return this.productsService.update(id, dtoPlain, productImages, presImages);
+    this.logger.log(
+      `INFO ACTULIZADA PRODUCTO:\n${JSON.stringify(dtoPlain, null, 2)}`,
+    );
+    return this.productsService.update(id, dtoPlain, productImages);
   }
 
   // ====== GET/PATCH catch-all por :id (al final para no tapar otros paths) ===

@@ -15,6 +15,7 @@ import { CreatePurchaseRequisitionDto } from './dto/create-purchase-requisition.
 import { UpdatePurchaseRequisitionDto } from './dto/update-purchase-requisition.dto';
 import { ComprasRegistrosQueryDto } from './dto/compras-registros.query.dto';
 import { RecepcionarCompraAutoDto } from './dto/compra-recepcion.dto';
+import { CreateCompraSinCargoFromRequisicionDto } from './dto/create-compra-sin-pago.dto';
 // import { CreateCompraRecepcionDto } from './dto/compra-recepcion.dto';
 
 @Controller('compra-requisicion')
@@ -49,6 +50,33 @@ export class PurchaseRequisitionsController {
    */
   @Post(':id/recepcionar')
   recepcionarById(
+    @Param('id', ParseIntPipe) id: number,
+    @Body()
+    body: Omit<RecepcionarCompraAutoDto, 'compraId'> & { compraId?: number },
+  ) {
+    return this.purchaseRequisitionsService.makeRecepcionCompraAuto({
+      ...body,
+      compraId: id,
+    });
+  }
+
+  @Post('requisicion/sin-cargo/recepcionar')
+  createCompraSinCargoFromRequisicion(
+    @Body() dto: CreateCompraSinCargoFromRequisicionDto,
+  ) {
+    return this.purchaseRequisitionsService.createCompraSinCargoFromRequisicion(
+      dto,
+    );
+  }
+
+  /**
+   * RECEPCIONAR UNA COMPRA AUTO SIN PARCIALES
+   * @param id ID de la compra
+   * @param body  cuerpo de params de la compra
+   * @returns
+   */
+  @Post(':id/recepcionar')
+  recepcionarLocal(
     @Param('id', ParseIntPipe) id: number,
     @Body()
     body: Omit<RecepcionarCompraAutoDto, 'compraId'> & { compraId?: number },

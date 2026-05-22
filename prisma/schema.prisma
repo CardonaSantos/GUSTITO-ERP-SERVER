@@ -306,12 +306,25 @@ model Producto {
   asientosContablesLineas AsientoContableLinea[]
   kardexValorizado        KardexValorizado[]
 
+  //NUEVO NO MIGRAR A NUEVA DB DE NOVA
+  tipoInventario           TipoProductoInventario @default(PRODUCTO_VENTA)
+  visibleEnPos             Boolean                @default(true)
+  //NUEVO NO MIGRAR A NUEVA DB DE NOVA
+
   // ELIMINACION
   activo      Boolean   @default(true)
   eliminado   Boolean   @default(false)
   eliminadoEn DateTime?
   eliminadoPorId Int?
 
+}
+
+
+enum TipoProductoInventario {
+  PRODUCTO_VENTA
+  EMPAQUE
+  INSUMO
+  MATERIAL_OPERATIVO
 }
 
 
