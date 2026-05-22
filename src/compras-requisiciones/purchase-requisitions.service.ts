@@ -35,6 +35,41 @@ import { MovimientoFinancieroService } from 'src/movimiento-financiero/movimient
 import { ProrrateoService } from 'src/prorrateo/prorrateo.service';
 import { PresupuestosService } from 'src/control-presupuestal/presupuestos/app/presupuestos.service';
 import { dayjs } from 'src/utils/dayjs';
+import { CreateCompraSinCargoFromRequisicionDto } from './dto/create-compra-sin-pago.dto';
+
+type RequisicionSinCargoTx = Prisma.RequisicionGetPayload<{
+  include: {
+    sucursal: { select: { id: true } };
+    lineas: {
+      include: {
+        producto: { select: { id: true } };
+      };
+    };
+  };
+}>;
+
+type CompraSinCargoTx = Prisma.CompraGetPayload<{
+  include: {
+    detalles: {
+      select: {
+        id: true;
+        cantidad: true;
+        costoUnitario: true;
+        productoId: true;
+        requisicionLineaId: true;
+        fechaVencimiento: true;
+      };
+    };
+    proveedor: { select: { id: true } };
+    requisicion: {
+      select: {
+        id: true;
+        presupuestoId: true;
+      };
+    };
+    sucursal: { select: { id: true } };
+  };
+}>;
 
 const N = (x: any) => (Number.isFinite(Number(x)) ? Number(x) : 0);
 
@@ -820,9 +855,10 @@ export class PurchaseRequisitionsService {
     }
   }
 
-  //=========================================================
   //                    RECEPCION TOTAL CASO 1
-  //=========================================================
+  /**
+   * REFEPCIONAR UNA COMPRA: CON PAGO Y DE FORMA NORMAL
+   */
   async makeRecepcionCompraAuto(dto: RecepcionarCompraAutoDto) {
     try {
       this.logger.log(
@@ -1613,7 +1649,7 @@ export class PurchaseRequisitionsService {
   }
 
   /**
-   *
+   * GENERAR UNA COMPRA A PARTIR DE UNA REQUISICION
    */
   async createCompraFromRequisiciones(
     createPurchaseRequisitionDto: CreatePurchaseRequisitionDto,
@@ -1806,5 +1842,711 @@ export class PurchaseRequisitionsService {
     }
   }
 
-  //AJUSTAR
+  //RECEPCION SIN COSTO
+
+  /**
+   * CREAR COMPRA SIN CARGO DESDE REQUISICIÓN Y RECEPCIONARLA A STOCK.
+   *
+   * Este flujo:
+   * - Crea registro histórico de compra.
+   * - Crea detalles de compra con costo 0.
+   * - Crea recepción de requisición.
+   * - Crea entrega de stock con monto 0.
+   * - Crea lotes en stock con costo 0.
+   * - Marca compra como RECIBIDO.
+   * - Marca requisición como COMPLETADA/RECIBIDA.
+   *
+   * Este flujo NO:
+   * - No genera pago.
+   * - No genera movimiento financiero.
+   * - No toca caja.
+   * - No toca banco.
+   * - No compromete presupuesto.
+   * - No ejerce presupuesto.
+   * - No usa lógica de presentaciones.
+   */
+  async createCompraSinCargoFromRequisicion(
+    dto: CreateCompraSinCargoFromRequisicionDto,
+  ) {
+    try {
+      this.logger.log(
+        `[COMPRA_SIN_CARGO] DTO recibido:\n${JSON.stringify(dto, null, 2)}`,
+      );
+
+      return await this.prisma.$transaction(async (tx) => {
+        const req = await this.getRequisicionParaCompraSinCargoTx(
+          tx,
+          dto.requisicionID,
+        );
+
+        this.validarRequisicionParaCompraSinCargo(req);
+
+        await this.validarRequisicionSinCompraPreviaTx(tx, req.id);
+
+        const compra = await this.crearCompraHistoricaSinCargoTx(tx, {
+          req,
+          usuarioId: dto.userID,
+          proveedorId: dto.proveedorId ?? null,
+          sucursalId: dto.sucursalId ?? req.sucursal.id,
+        });
+
+        const recepcion = await this.recepcionarCompraSinCargoAStockTx(tx, {
+          compraId: compra.id,
+          usuarioId: dto.userID,
+          observaciones: dto.observaciones ?? null,
+        });
+
+        const compraFinal = await tx.compra.findUnique({
+          where: { id: compra.id },
+          include: {
+            detalles: {
+              include: {
+                producto: true,
+                requisicionLinea: true,
+              },
+            },
+            proveedor: true,
+            sucursal: true,
+            requisicion: true,
+          },
+        });
+
+        return {
+          ok: true,
+          message:
+            'Compra sin cargo creada y recepcionada a stock correctamente.',
+          compra: {
+            id: compraFinal?.id ?? compra.id,
+            total: compraFinal?.total ?? 0,
+            estado: compraFinal?.estado ?? 'RECIBIDO',
+            ingresadaAStock: compraFinal?.ingresadaAStock ?? true,
+            origen: compraFinal?.origen ?? 'REQUISICION',
+          },
+          requisicion: {
+            id: req.id,
+            estado: recepcion.estadoRequisicion,
+          },
+          recepcion: {
+            id: recepcion.requisicionRecepcionId,
+          },
+          entregaStock: {
+            id: recepcion.entregaStockId,
+          },
+          stock: {
+            createdCount: recepcion.stockCreatedCount,
+          },
+          lineas: recepcion.lineas,
+        };
+      });
+    } catch (error) {
+      this.logger.error('[COMPRA_SIN_CARGO] Error generado:', error);
+
+      if (error instanceof HttpException) throw error;
+
+      throw new InternalServerErrorException(
+        'No fue posible crear y recepcionar la compra sin cargo.',
+      );
+    }
+  }
+
+  /**
+   * Busca la requisición con sus líneas.
+   * No incluye presentaciones porque este flujo ya no trabaja esa lógica.
+   */
+  private async getRequisicionParaCompraSinCargoTx(
+    tx: Prisma.TransactionClient,
+    requisicionId: number,
+  ): Promise<RequisicionSinCargoTx> {
+    const req = await tx.requisicion.findUnique({
+      where: { id: requisicionId },
+      include: {
+        sucursal: { select: { id: true } },
+        lineas: {
+          include: {
+            producto: { select: { id: true } },
+          },
+        },
+      },
+    });
+
+    if (!req) {
+      throw new NotFoundException(
+        `No se encontró la requisición #${requisicionId}.`,
+      );
+    }
+
+    return req;
+  }
+
+  /**
+   * Validaciones básicas antes de crear la compra.
+   */
+  private validarRequisicionParaCompraSinCargo(req: RequisicionSinCargoTx) {
+    if (!req.sucursal?.id) {
+      throw new BadRequestException(
+        `La requisición #${req.id} no tiene sucursal asociada.`,
+      );
+    }
+
+    if (!req.lineas.length) {
+      throw new BadRequestException(
+        `La requisición #${req.id} no tiene líneas para recepcionar.`,
+      );
+    }
+
+    const lineasInvalidas = req.lineas.filter((ln) => {
+      const cantidad = Number(ln.cantidadSugerida ?? 0);
+      return !Number.isFinite(cantidad) || cantidad <= 0 || !ln.producto?.id;
+    });
+
+    if (lineasInvalidas.length > 0) {
+      throw new BadRequestException(
+        `La requisición #${req.id} tiene líneas inválidas: ${lineasInvalidas
+          .map((ln) => `#${ln.id}`)
+          .join(', ')}.`,
+      );
+    }
+  }
+
+  /**
+   * Evita duplicar compras para la misma requisición.
+   */
+  private async validarRequisicionSinCompraPreviaTx(
+    tx: Prisma.TransactionClient,
+    requisicionId: number,
+  ) {
+    const existing = await tx.compra.findFirst({
+      where: { requisicionId },
+      select: { id: true, estado: true },
+    });
+
+    if (existing) {
+      throw new BadRequestException(
+        `La requisición #${requisicionId} ya tiene una compra asociada: compra #${existing.id}.`,
+      );
+    }
+  }
+
+  /**
+   * Crea la compra histórica con costo 0.
+   *
+   * Importante:
+   * - total = 0
+   * - costoUnitario = 0
+   * - estado inicial ESPERANDO_ENTREGA para respetar el flujo conceptual
+   * - luego la función de recepción la pasa a RECIBIDO
+   */
+  private async crearCompraHistoricaSinCargoTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      req: RequisicionSinCargoTx;
+      usuarioId: number;
+      proveedorId?: number | null;
+      sucursalId: number;
+    },
+  ) {
+    const { req, usuarioId, proveedorId, sucursalId } = params;
+
+    const compra = await tx.compra.create({
+      data: {
+        fecha: dayjs().tz(TZGT).toDate(),
+        total: 0,
+        usuario: { connect: { id: usuarioId } },
+        sucursal: { connect: { id: sucursalId } },
+        requisicion: { connect: { id: req.id } },
+        proveedor: proveedorId ? { connect: { id: proveedorId } } : undefined,
+        estado: 'ESPERANDO_ENTREGA',
+        origen: 'REQUISICION',
+      },
+    });
+
+    for (const linea of req.lineas) {
+      await tx.compraDetalle.create({
+        data: {
+          cantidad: Number(linea.cantidadSugerida),
+          costoUnitario: 0,
+          producto: { connect: { id: linea.producto.id } },
+          compra: { connect: { id: compra.id } },
+          requisicionLinea: { connect: { id: linea.id } },
+          fechaVencimiento: linea.fechaExpiracion ?? null,
+        },
+      });
+    }
+
+    await tx.requisicion.update({
+      where: { id: req.id },
+      data: {
+        estado: 'ENVIADA_COMPRAS',
+      },
+    });
+
+    this.logger.log(
+      `[COMPRA_SIN_CARGO] Compra histórica #${compra.id} creada desde requisición #${req.id}.`,
+    );
+
+    return compra;
+  }
+
+  /**
+   * Recepciona la compra sin cargo y genera stock base.
+   *
+   * No usa presentaciones.
+   * No genera movimiento financiero.
+   * No ejerce presupuesto.
+   */
+  private async recepcionarCompraSinCargoAStockTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      compraId: number;
+      usuarioId: number;
+      observaciones?: string | null;
+    },
+  ) {
+    const { compraId, usuarioId, observaciones } = params;
+
+    const compra = await this.getCompraSinCargoParaRecepcionTx(tx, compraId);
+
+    if (compra.ingresadaAStock) {
+      throw new BadRequestException(
+        `La compra #${compra.id} ya fue ingresada a stock.`,
+      );
+    }
+
+    if (!compra.requisicion?.id) {
+      throw new BadRequestException(
+        `La compra #${compra.id} no está ligada a una requisición.`,
+      );
+    }
+
+    const sucursalId = compra.sucursal?.id;
+
+    if (!sucursalId) {
+      throw new BadRequestException(
+        `La compra #${compra.id} no tiene sucursal asociada.`,
+      );
+    }
+
+    if (!compra.detalles.length) {
+      throw new BadRequestException(
+        `La compra #${compra.id} no tiene detalles para recepcionar.`,
+      );
+    }
+
+    const requisicionRecepcion = await tx.requisicionRecepcion.create({
+      data: {
+        observaciones:
+          observaciones ??
+          `Recepción automática sin cargo desde compra #${compra.id}.`,
+        usuario: { connect: { id: usuarioId } },
+        requisicion: { connect: { id: compra.requisicion.id } },
+        fechaRecepcion: dayjs().tz(TZGT).toDate(),
+      },
+    });
+
+    const entregaStock = await this.crearEntregaStockSinCargoTx(tx, {
+      compraId: compra.id,
+      proveedorId: compra.proveedor?.id ?? null,
+      sucursalId,
+      usuarioId,
+    });
+
+    const now = dayjs().tz(TZGT).toDate();
+
+    const lineasRecepcion: Array<{
+      compraDetalleId: number;
+      requisicionLineaId: number | null;
+      productoId: number;
+      cantidadSolicitada: number;
+      cantidadRecibida: number;
+      precioUnitario: number;
+    }> = [];
+
+    const stockCreated: Array<{
+      id: number;
+      productoId: number;
+      cantidad: number;
+    }> = [];
+
+    const acumuladoPorProducto: Record<number, number> = {};
+    const productIds = [
+      ...new Set(
+        compra.detalles
+          .map((det) => det.productoId)
+          .filter((id): id is number => Number.isFinite(Number(id))),
+      ),
+    ];
+
+    const stockAnteriorPorProducto = await this.getStockAnteriorPorProductoTx(
+      tx,
+      {
+        productIds,
+        sucursalId,
+      },
+    );
+
+    for (const det of compra.detalles) {
+      const productoId = det.productoId;
+
+      if (!productoId) {
+        throw new BadRequestException(
+          `El detalle de compra #${det.id} no tiene producto asociado.`,
+        );
+      }
+
+      const cantidad = Number(det.cantidad ?? 0);
+
+      if (!Number.isFinite(cantidad) || cantidad <= 0) {
+        throw new BadRequestException(
+          `El detalle de compra #${det.id} tiene una cantidad inválida.`,
+        );
+      }
+
+      if (!det.requisicionLineaId) {
+        throw new BadRequestException(
+          `El detalle de compra #${det.id} no está ligado a una línea de requisición.`,
+        );
+      }
+
+      await this.registrarLineaRecepcionSinCargoTx(tx, {
+        requisicionRecepcionId: requisicionRecepcion.id,
+        requisicionLineaId: det.requisicionLineaId,
+        productoId,
+        cantidad,
+      });
+
+      const stock = await tx.stock.create({
+        data: {
+          cantidad,
+          cantidadInicial: cantidad,
+          costoTotal: 0,
+          fechaIngreso: now,
+          fechaVencimiento: det.fechaVencimiento ?? null,
+          precioCosto: 0,
+          sucursal: { connect: { id: sucursalId } },
+          producto: { connect: { id: productoId } },
+          entregaStock: { connect: { id: entregaStock.id } },
+          requisicionRecepcion: {
+            connect: { id: requisicionRecepcion.id },
+          },
+        },
+      });
+
+      await tx.historialStock.create({
+        data: {
+          tipo: 'ENTREGA_STOCK',
+          fechaCambio: now,
+          sucursalId,
+          usuarioId,
+          productoId,
+          comentario: `Ingreso sin cargo desde compra #${compra.id}`,
+        },
+      });
+
+      acumuladoPorProducto[productoId] =
+        (acumuladoPorProducto[productoId] ?? 0) + cantidad;
+
+      stockCreated.push({
+        id: stock.id,
+        productoId,
+        cantidad,
+      });
+
+      lineasRecepcion.push({
+        compraDetalleId: det.id,
+        requisicionLineaId: det.requisicionLineaId,
+        productoId,
+        cantidadSolicitada: cantidad,
+        cantidadRecibida: cantidad,
+        precioUnitario: 0,
+      });
+    }
+
+    await this.registrarTrackingEntregaSinCargoTx(tx, {
+      entregaStockId: entregaStock.id,
+      sucursalId,
+      usuarioId,
+      acumuladoPorProducto,
+      stockAnteriorPorProducto,
+      compraId: compra.id,
+    });
+
+    const cantidadRecibidaTotal = lineasRecepcion.reduce(
+      (acc, ln) => acc + ln.cantidadRecibida,
+      0,
+    );
+
+    await tx.compra.update({
+      where: { id: compra.id },
+      data: {
+        total: 0,
+        estado: 'RECIBIDO',
+        ingresadaAStock: true,
+        cantidadRecibidaAcumulada:
+          Number(compra.cantidadRecibidaAcumulada ?? 0) + cantidadRecibidaTotal,
+      },
+    });
+
+    const estadoRequisicion = await this.actualizarEstadoRequisicionRecibidaTx(
+      tx,
+      compra.requisicion.id,
+    );
+
+    this.logger.log(
+      `[COMPRA_SIN_CARGO] Compra #${compra.id} recepcionada sin cargo. Stock creado: ${stockCreated.length}.`,
+    );
+
+    return {
+      requisicionRecepcionId: requisicionRecepcion.id,
+      entregaStockId: entregaStock.id,
+      stockCreatedCount: stockCreated.length,
+      estadoRequisicion,
+      lineas: lineasRecepcion,
+    };
+  }
+
+  /**
+   * Carga compra recién creada para recepción.
+   */
+  private async getCompraSinCargoParaRecepcionTx(
+    tx: Prisma.TransactionClient,
+    compraId: number,
+  ): Promise<CompraSinCargoTx> {
+    const compra = await tx.compra.findUnique({
+      where: { id: compraId },
+      include: {
+        detalles: {
+          select: {
+            id: true,
+            cantidad: true,
+            costoUnitario: true,
+            productoId: true,
+            requisicionLineaId: true,
+            fechaVencimiento: true,
+          },
+        },
+        proveedor: { select: { id: true } },
+        requisicion: {
+          select: {
+            id: true,
+            presupuestoId: true,
+          },
+        },
+        sucursal: { select: { id: true } },
+      },
+    });
+
+    if (!compra) {
+      throw new NotFoundException(`No se encontró la compra #${compraId}.`);
+    }
+
+    return compra;
+  }
+
+  /**
+   * Crea cabecera de entrega de stock con monto 0.
+   *
+   * No uso generateStockFromRequisicion aquí porque tu helper actual conecta proveedor
+   * directamente, y para este flujo proveedor puede ser opcional.
+   */
+  private async crearEntregaStockSinCargoTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      compraId: number;
+      proveedorId?: number | null;
+      sucursalId: number;
+      usuarioId: number;
+    },
+  ) {
+    const { compraId, proveedorId, sucursalId, usuarioId } = params;
+
+    return tx.entregaStock.create({
+      data: {
+        proveedor: proveedorId ? { connect: { id: proveedorId } } : undefined,
+        montoTotal: 0,
+        fechaEntrega: dayjs().tz(TZGT).toDate(),
+        usuarioRecibido: { connect: { id: usuarioId } },
+        sucursal: { connect: { id: sucursalId } },
+        // Si tu modelo EntregaStock tiene campo observacion/comentario, puedes agregarlo aquí.
+        // observaciones: `Entrega sin cargo desde compra #${compraId}`,
+      },
+    });
+  }
+
+  /**
+   * Crea línea de recepción y actualiza la línea de requisición.
+   */
+  private async registrarLineaRecepcionSinCargoTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      requisicionRecepcionId: number;
+      requisicionLineaId: number;
+      productoId: number;
+      cantidad: number;
+    },
+  ) {
+    const { requisicionRecepcionId, requisicionLineaId, productoId, cantidad } =
+      params;
+
+    const reqLinea = await tx.requisicionLinea.findUnique({
+      where: { id: requisicionLineaId },
+      select: {
+        id: true,
+        cantidadRecibida: true,
+        cantidadSugerida: true,
+      },
+    });
+
+    if (!reqLinea) {
+      throw new NotFoundException(
+        `No se encontró la línea de requisición #${requisicionLineaId}.`,
+      );
+    }
+
+    await tx.requisicionRecepcionLinea.create({
+      data: {
+        requisicionRecepcion: {
+          connect: { id: requisicionRecepcionId },
+        },
+        requisicionLinea: {
+          connect: { id: requisicionLineaId },
+        },
+        producto: {
+          connect: { id: productoId },
+        },
+        cantidadSolicitada: cantidad,
+        cantidadRecibida: cantidad,
+        ingresadaAStock: true,
+      },
+    });
+
+    await tx.requisicionLinea.update({
+      where: { id: requisicionLineaId },
+      data: {
+        cantidadRecibida: Number(reqLinea.cantidadRecibida ?? 0) + cantidad,
+        ingresadaAStock: true,
+      },
+    });
+  }
+
+  /**
+   * Obtiene stock anterior antes de insertar el nuevo stock.
+   * Esto deja el tracking más correcto que calcularlo después de insertar.
+   */
+  private async getStockAnteriorPorProductoTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      productIds: number[];
+      sucursalId: number;
+    },
+  ): Promise<Record<number, number>> {
+    const { productIds, sucursalId } = params;
+
+    const result: Record<number, number> = {};
+
+    for (const productoId of productIds) {
+      const agg = await tx.stock.aggregate({
+        where: {
+          productoId,
+          sucursalId,
+        },
+        _sum: {
+          cantidad: true,
+        },
+      });
+
+      result[productoId] = Number(agg._sum.cantidad ?? 0);
+    }
+
+    return result;
+  }
+
+  /**
+   * Registra tracking de entrega de stock.
+   */
+  private async registrarTrackingEntregaSinCargoTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      entregaStockId: number;
+      sucursalId: number;
+      usuarioId: number;
+      compraId: number;
+      acumuladoPorProducto: Record<number, number>;
+      stockAnteriorPorProducto: Record<number, number>;
+    },
+  ) {
+    const {
+      entregaStockId,
+      sucursalId,
+      usuarioId,
+      compraId,
+      acumuladoPorProducto,
+      stockAnteriorPorProducto,
+    } = params;
+
+    const productIds = Object.keys(acumuladoPorProducto).map(Number);
+
+    if (!productIds.length) return;
+
+    const trackers = productIds.map((productoId) => ({
+      productoId,
+      cantidadVendida: acumuladoPorProducto[productoId],
+      cantidadAnterior: stockAnteriorPorProducto[productoId] ?? 0,
+    }));
+
+    await this.tracker.trackeEntregaStock(
+      tx,
+      trackers,
+      sucursalId,
+      usuarioId,
+      entregaStockId,
+      'ENTREGA_STOCK',
+      `Recepción sin cargo desde COMPRA #${compraId}`,
+    );
+  }
+
+  /**
+   * Marca requisición como recibida/completada.
+   */
+  private async actualizarEstadoRequisicionRecibidaTx(
+    tx: Prisma.TransactionClient,
+    requisicionId: number,
+  ) {
+    const req = await tx.requisicion.findUnique({
+      where: { id: requisicionId },
+      include: {
+        lineas: {
+          select: {
+            id: true,
+            cantidadSugerida: true,
+            cantidadRecibida: true,
+          },
+        },
+      },
+    });
+
+    if (!req) {
+      throw new NotFoundException(
+        `No se encontró la requisición #${requisicionId}.`,
+      );
+    }
+
+    const todasRecibidas = req.lineas.every((ln) => {
+      return (
+        Number(ln.cantidadRecibida ?? 0) >= Number(ln.cantidadSugerida ?? 0)
+      );
+    });
+
+    const estado = todasRecibidas ? 'COMPLETADA' : 'RECIBIDA';
+
+    await tx.requisicion.update({
+      where: { id: requisicionId },
+      data: {
+        fechaRecepcion: dayjs().tz(TZGT).toDate(),
+        ingresadaAStock: true,
+        estado,
+      },
+    });
+
+    return estado;
+  }
 }
